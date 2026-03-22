@@ -34,6 +34,8 @@ AUDIO_EXTS = {'.mp3', '.m4a', '.m4b', '.aac', '.ogg', '.opus', '.flac', '.wav', 
 _PLACEHOLDER_ARTISTS = frozenset({
     'artist', 'unknown', 'unknown author', 'unknown artist',
     'various', 'various artists', 'author', 'narrator', 'n/a', 'na',
+    # Franchise/series names sometimes embedded in artist tags by rippers
+    'star wars', 'marvel', 'dc comics', 'bbc', 'audible',
 })
 
 STOPWORDS = {
@@ -92,6 +94,7 @@ def clean_title(title: str) -> str:
     title = re.sub(r'\s*[\[\(]?(disc|disk|cd|part|volume|vol)\s*\d+[\]\)]?', '', title, flags=re.IGNORECASE)
     title = re.sub(
         r'\s*[\[\(]?(unabridged|abridged|unb\b|isis audio ?books?|corgi audio|bbc radio|'
+        r'podium|audible studios|listening library|macmillan audio|tantor|brilliance audio|'
         r'full[ -]cast drama|full cast|\d{2,3}br|vbr|mp3|m4b)[\]\)]?',
         '', title, flags=re.IGNORECASE,
     )
@@ -105,6 +108,8 @@ def clean_title(title: str) -> str:
     title = re.sub(r'\s+[A-Z]\.\s*[A-Z][a-z]+\.?\s*$', '', title)                 # trailing narrator J.Johnson
     title = re.sub(r'^\d+[.\s]+(?=\d)', '', title)
     title = re.sub(r'^\d+\s+[AB]BY\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'^Year\s+\d+(?:\s*[-–]\s*\d+)?\s*[-–—]\s*', '', title, flags=re.IGNORECASE)  # Year 36 -, Year 12-13 -
+    title = re.sub(r'^Book\s+[Tt]he\s+\d+(?:st|nd|rd|th)\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)  # Book The 1st-, Book the 2nd -
     title = re.sub(r'^\d+(?:\.\d+)?\s*[\-\.]?\s*', '', title)
     return title.strip(' -_.')
 
@@ -222,15 +227,23 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
         primary = rt.split(':', 1)[0].strip()
         if len(primary) > 5:
             rt_variants.append(primary)
+    if ' - ' in rt:
+        last_seg = rt.rsplit(' - ', 1)[1].strip()
+        if len(last_seg) > 5 and last_seg not in rt_variants:
+            rt_variants.append(last_seg)
 
     ts = max(_similarity(qv, rv) for qv in q_variants for rv in rt_variants)
+    # Small tiebreaker: reward results whose full title matches the full query well.
+    # This helps when many books share the same short title (e.g. "Invincible") —
+    # the one whose full title also contains the series context scores slightly higher.
+    full_bonus = _similarity(query_title, rt) * 0.01
 
     is_unknown = query_author.lower() in ('', 'unknown', 'unknown author')
     if is_unknown:
-        return ts + quality_bonus
+        return ts + full_bonus + quality_bonus
 
     author_score = _similarity(query_author, result.get('author', ''))
-    return ts * 0.65 + author_score * 0.33 + quality_bonus
+    return ts * 0.65 + author_score * 0.33 + full_bonus + quality_bonus
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +358,10 @@ def search_metadata(title: str, author: str) -> list:
 
         return combined
 
-    results = _run(title, author)
+    # Don't include placeholder authors (e.g. "Unknown Author") in the API
+    # query — they pollute search results and prevent finding the correct book.
+    search_author = '' if author.lower() in _PLACEHOLDER_ARTISTS else author
+    results = _run(title, search_author)
 
     if not results:
         print("    [!] No results for title+author — retrying with title only …")
@@ -609,7 +625,10 @@ def process_book(
     raw_album  = initial['album']  if initial else book_dir.name
     raw_artist = initial['artist'] if initial else 'Unknown Author'
 
-    use_folder   = 'unknown' in raw_album.lower() or len(book_dir.name) > len(raw_album) + 8
+    # Only prefer the folder name when the album tag is absent, a placeholder,
+    # or very short (< 15 chars) — avoids using noisy folder names over clean
+    # album tags that happen to be shorter (e.g. "Album" vs "Album - NoisySuffix").
+    use_folder   = 'unknown' in raw_album.lower() or (len(raw_album) < 15 and len(book_dir.name) > len(raw_album) + 8)
     early_title  = clean_title(book_dir.name if use_folder else raw_album)
     early_author = normalise_author(raw_artist)
     early_title  = strip_author_from_title(early_title, early_author)
@@ -654,6 +673,12 @@ def process_book(
     output_file     = output_dir / output_filename
 
     print(f"[*] Output: {output_file}")
+
+    if output_file.exists():
+        print("[!] Output file already exists — skipping.")
+        if existing_stems is not None:
+            existing_stems.append(strip_author_prefix(output_file.stem.lower()))
+        return
 
     if dry_run:
         print("[~] Dry run — nothing written.")

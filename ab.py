@@ -37,7 +37,8 @@ STOPWORDS = {
 }
 
 STRUCTURAL_FOLDER_RE = re.compile(
-    r'^((cd|disc|disk|part|volume|vol)\s*\d+|unabridged|abridged|mp3|audiobooks?)$',
+    r'(?:^|\s)(cd|disc|disk|part|volume|vol)\s*\d+$'
+    r'|^(unabridged|abridged|mp3|audiobooks?)$',
     flags=re.IGNORECASE,
 )
 
@@ -332,11 +333,18 @@ def interactive_lookup(
 
     if not results:
         print("    [!] No results found online.")
+        if auto_lookup:
+            print("    [~] Auto-lookup: skipping online metadata, using local info.")
+            return title, norm_author, None, '', False
     else:
         if auto_lookup:
             res   = results[0]
+            score = _score_result(res, title, norm_author)
+            if score < 0.40:
+                print(f"    [~] Auto-lookup: best match score {score:.2f} is too low — using local info.")
+                return title, norm_author, None, '', False
             flags = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
-            print(f"    [+] Auto-selected: {res['title']}  {flags}")
+            print(f"    [+] Auto-selected: {res['title']}  score={score:.2f}  {flags}")
             return res['title'], res['author'], res['cover_url'], res['desc'], False
 
         if (
@@ -396,7 +404,7 @@ def find_audiobooks(input_dir: Path) -> dict:
 
     for file in all_files:
         parent   = file.parent
-        book_dir = parent.parent if STRUCTURAL_FOLDER_RE.match(parent.name) else parent
+        book_dir = parent.parent if STRUCTURAL_FOLDER_RE.search(parent.name) else parent
         if book_dir == root:
             loose_count += 1
             continue

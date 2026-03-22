@@ -92,6 +92,7 @@ def clean_title(title: str) -> str:
     )
     title = re.sub(r'\s*[\(\[]?\d{1,2}/\d{1,2}/\d{2,4}.*?[\)\]]?', '', title)
     title = re.sub(r'\(\s*[uU]\s*\d+\.\d+\s*\)', '', title)
+    title = re.sub(r'^\d+[.\s]+(?=\d)', '', title)          # strip leading ordinal "04. " before year
     title = re.sub(r'^\d+\s+[AB]BY\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)
     title = re.sub(r'^\d+(?:\.\d+)?\s*[\-\.]?\s*', '', title)
     return title.strip(' -_')

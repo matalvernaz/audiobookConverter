@@ -91,7 +91,7 @@ def strip_author_from_title(title: str, author: str) -> str:
 def clean_title(title: str) -> str:
     title = re.sub(r'\s*[\[\(]?(disc|disk|cd|part|volume|vol)\s*\d+[\]\)]?', '', title, flags=re.IGNORECASE)
     title = re.sub(
-        r'\s*[\[\(]?(unabridged|abridged|unb|isis audio ?books?|corgi audio|bbc radio|'
+        r'\s*[\[\(]?(unabridged|abridged|unb\b|isis audio ?books?|corgi audio|bbc radio|'
         r'full[ -]cast drama|full cast|\d{2,3}br|vbr|mp3|m4b)[\]\)]?',
         '', title, flags=re.IGNORECASE,
     )

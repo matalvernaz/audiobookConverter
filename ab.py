@@ -101,6 +101,7 @@ def clean_title(title: str) -> str:
     title = re.sub(r'\s+\d{2}[:.]\d{2}[:.]\d{2}', '', title)                      # HH:MM:SS or HH.MM.SS duration
     title = re.sub(r'\s+\d+k\b', '', title, flags=re.IGNORECASE)                   # bitrate e.g. 62k 128K
     title = re.sub(r'^\s*[A-Z]{1,5}-\d+\s*[-–]\s*', '', title)                    # series codes e.g. MR-02 -
+    title = re.sub(r'([a-zA-Z])\d{1,2}(?=\s+-\s)', r'\1', title)                  # strip number embedded in series name: Flamel02 → Flamel
     title = re.sub(r'\s+[A-Z]\.\s*[A-Z][a-z]+\.?\s*$', '', title)                 # trailing narrator J.Johnson
     title = re.sub(r'^\d+[.\s]+(?=\d)', '', title)
     title = re.sub(r'^\d+\s+[AB]BY\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)
@@ -193,11 +194,43 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
     Return a 0–1 score for how well a metadata result matches the query.
     Title similarity is weighted more heavily than author similarity.
     Cover art and a description give a small quality bonus.
+
+    Title scoring uses the BEST match across combinations of:
+      - query variants: full title, and the part after the first ' - '
+        (the bare book title when a series prefix is present)
+      - result variants: full title, and the part before the first ':'
+        (the primary title when a subtitle/series qualifier follows)
+
+    This lets "Series 01 - BookTitle" correctly match "BookTitle: Series Qualifier"
+    even when the long forms score poorly against each other.
+
+    When the author is unknown the score is based on title only, since adding
+    "Unknown Author" to the author weight only penalises the score unfairly.
     """
-    title_score   = _similarity(query_title,  result.get('title',  ''))
-    author_score  = _similarity(query_author, result.get('author', ''))
+    rt            = result.get('title', '')
     quality_bonus = (0.02 if result.get('cover_url') else 0) + (0.02 if result.get('desc') else 0)
-    return title_score * 0.65 + author_score * 0.33 + quality_bonus
+
+    # Build title variants
+    q_variants = [query_title]
+    if ' - ' in query_title:
+        short = query_title.split(' - ', 1)[1].strip()
+        if short:
+            q_variants.append(short)
+
+    rt_variants = [rt]
+    if ':' in rt:
+        primary = rt.split(':', 1)[0].strip()
+        if len(primary) > 5:
+            rt_variants.append(primary)
+
+    ts = max(_similarity(qv, rv) for qv in q_variants for rv in rt_variants)
+
+    is_unknown = query_author.lower() in ('', 'unknown', 'unknown author')
+    if is_unknown:
+        return ts + quality_bonus
+
+    author_score = _similarity(query_author, result.get('author', ''))
+    return ts * 0.65 + author_score * 0.33 + quality_bonus
 
 
 # ---------------------------------------------------------------------------

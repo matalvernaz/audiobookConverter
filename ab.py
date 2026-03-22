@@ -31,6 +31,11 @@ from html.parser import HTMLParser
 
 AUDIO_EXTS = {'.mp3', '.m4a', '.m4b', '.aac', '.ogg', '.opus', '.flac', '.wav', '.wma'}
 
+_PLACEHOLDER_ARTISTS = frozenset({
+    'artist', 'unknown', 'unknown author', 'unknown artist',
+    'various', 'various artists', 'author', 'narrator', 'n/a', 'na',
+})
+
 STOPWORDS = {
     'the', 'a', 'an', 'of', 'and', 'in', 'to', 'is', 'it', 'at', 'on',
     'by', 'for', 'with', 'from', 'or', 'as', 'be', 'this', 'that',
@@ -86,16 +91,21 @@ def strip_author_from_title(title: str, author: str) -> str:
 def clean_title(title: str) -> str:
     title = re.sub(r'\s*[\[\(]?(disc|disk|cd|part|volume|vol)\s*\d+[\]\)]?', '', title, flags=re.IGNORECASE)
     title = re.sub(
-        r'\s*[\[\(]?(unabridged|abridged|isis audio ?books?|corgi audio|bbc radio|'
-        r'\d{2,3}br|vbr|mp3|m4b)[\]\)]?',
+        r'\s*[\[\(]?(unabridged|abridged|unb|isis audio ?books?|corgi audio|bbc radio|'
+        r'full[ -]cast drama|full cast|\d{2,3}br|vbr|mp3|m4b)[\]\)]?',
         '', title, flags=re.IGNORECASE,
     )
     title = re.sub(r'\s*[\(\[]?\d{1,2}/\d{1,2}/\d{2,4}.*?[\)\]]?', '', title)
     title = re.sub(r'\(\s*[uU]\s*\d+\.\d+\s*\)', '', title)
-    title = re.sub(r'^\d+[.\s]+(?=\d)', '', title)          # strip leading ordinal "04. " before year
+    title = re.sub(r'\s*\{[^}]+\}', '', title)                                     # {106mb} file-size tags
+    title = re.sub(r'\s+\d{2}[:.]\d{2}[:.]\d{2}', '', title)                      # HH:MM:SS or HH.MM.SS duration
+    title = re.sub(r'\s+\d+k\b', '', title, flags=re.IGNORECASE)                   # bitrate e.g. 62k 128K
+    title = re.sub(r'^\s*[A-Z]{1,5}-\d+\s*[-–]\s*', '', title)                    # series codes e.g. MR-02 -
+    title = re.sub(r'\s+[A-Z]\.\s*[A-Z][a-z]+\.?\s*$', '', title)                 # trailing narrator J.Johnson
+    title = re.sub(r'^\d+[.\s]+(?=\d)', '', title)
     title = re.sub(r'^\d+\s+[AB]BY\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)
     title = re.sub(r'^\d+(?:\.\d+)?\s*[\-\.]?\s*', '', title)
-    return title.strip(' -_')
+    return title.strip(' -_.')
 
 
 def _ffmeta_escape(value: str) -> str:
@@ -308,6 +318,14 @@ def search_metadata(title: str, author: str) -> list:
         print("    [!] No results for title+author — retrying with title only …")
         results = _run(title, '')
 
+    if not results and ' - ' in title:
+        short_title = strip_author_prefix(title)
+        if short_title != title:
+            print(f"    [!] Retrying with short title: '{short_title}' …")
+            results = _run(short_title, author)
+            if not results:
+                results = _run(short_title, '')
+
     # Rank best match first
     results.sort(key=lambda r: _score_result(r, title, author), reverse=True)
 
@@ -456,7 +474,9 @@ def probe_file(filepath: Path):
             'sample_rate': stream.get('sample_rate', ''),
             'channels':    stream.get('channels', 2),
             'title':       tags.get('title', filepath.stem),
-            'artist':      tags.get('artist') or tags.get('album_artist') or 'Unknown Author',
+            'artist':      (lambda a: 'Unknown Author' if a.lower() in _PLACEHOLDER_ARTISTS else a)(
+                               tags.get('artist') or tags.get('album_artist') or 'Unknown Author'
+                           ),
             'album':       tags.get('album', 'Unknown Audiobook'),
         }
     except Exception:

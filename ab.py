@@ -45,6 +45,7 @@ STOPWORDS = {
 
 STRUCTURAL_FOLDER_RE = re.compile(
     r'(?:^|\s)(cd|disc|disk|part|volume|vol)\s*\d+$'
+    r'|\[(cd|disc|disk|part|volume|vol)\s*\d+\]$'
     r'|^(unabridged|abridged|mp3|audiobooks?)$',
     flags=re.IGNORECASE,
 )

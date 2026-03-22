@@ -355,17 +355,24 @@ def search_metadata(title: str, author: str) -> list:
     # short-title search and merge the results.  The full-query "Series - Book
     # Unknown Author" often returns irrelevant results, leaving the correct book
     # out of the candidate list entirely.
+    # Also try the prefix segment (before ' - ') for "Franchise - Subtitle"
+    # patterns (e.g. "Dungeon Crawler Carl - Audio Immersion Tunnel Season 1").
     if ' - ' in title:
+        existing = {(r['title'].lower(), r['author'].lower()) for r in results}
+        def _merge(extra_results: list) -> None:
+            for item in extra_results:
+                key = (item['title'].lower(), item['author'].lower())
+                if key not in existing:
+                    results.append(item)
+                    existing.add(key)
+
         short_title = title.split(' - ', 1)[1].strip()
         if short_title and short_title != title:
-            extra = _run(short_title, '')
-            if extra:
-                existing = {(r['title'].lower(), r['author'].lower()) for r in results}
-                for item in extra:
-                    key = (item['title'].lower(), item['author'].lower())
-                    if key not in existing:
-                        results.append(item)
-                        existing.add(key)
+            _merge(_run(short_title, ''))
+
+        first_part = title.split(' - ', 1)[0].strip()
+        if first_part and first_part != title and first_part != short_title and len(first_part) >= 8:
+            _merge(_run(first_part, ''))
     # Rank best match first
     results.sort(key=lambda r: _score_result(r, title, author), reverse=True)
 

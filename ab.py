@@ -351,14 +351,21 @@ def search_metadata(title: str, author: str) -> list:
         print("    [!] No results for title+author — retrying with title only …")
         results = _run(title, '')
 
-    if not results and ' - ' in title:
-        short_title = strip_author_prefix(title)
-        if short_title != title:
-            print(f"    [!] Retrying with short title: '{short_title}' …")
-            results = _run(short_title, author)
-            if not results:
-                results = _run(short_title, '')
-
+    # For series-prefix titles like "Series N - BookTitle", ALWAYS also run a
+    # short-title search and merge the results.  The full-query "Series - Book
+    # Unknown Author" often returns irrelevant results, leaving the correct book
+    # out of the candidate list entirely.
+    if ' - ' in title:
+        short_title = title.split(' - ', 1)[1].strip()
+        if short_title and short_title != title:
+            extra = _run(short_title, '')
+            if extra:
+                existing = {(r['title'].lower(), r['author'].lower()) for r in results}
+                for item in extra:
+                    key = (item['title'].lower(), item['author'].lower())
+                    if key not in existing:
+                        results.append(item)
+                        existing.add(key)
     # Rank best match first
     results.sort(key=lambda r: _score_result(r, title, author), reverse=True)
 

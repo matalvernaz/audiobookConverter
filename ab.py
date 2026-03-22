@@ -72,6 +72,17 @@ def strip_author_prefix(filename_stem: str) -> str:
     return filename_stem.strip()
 
 
+def strip_author_from_title(title: str, author: str) -> str:
+    """Remove a leading author name from a title string if present."""
+    if not author or author.lower() in ('unknown author', 'unknown'):
+        return title
+    if title.lower().startswith(author.lower()):
+        stripped = title[len(author):].strip(' -_')
+        if stripped:
+            return stripped
+    return title
+
+
 def clean_title(title: str) -> str:
     title = re.sub(r'\s*[\[\(]?(disc|disk|cd|part|volume|vol)\s*\d+[\]\)]?', '', title, flags=re.IGNORECASE)
     title = re.sub(
@@ -81,6 +92,7 @@ def clean_title(title: str) -> str:
     )
     title = re.sub(r'\s*[\(\[]?\d{1,2}/\d{1,2}/\d{2,4}.*?[\)\]]?', '', title)
     title = re.sub(r'\(\s*[uU]\s*\d+\.\d+\s*\)', '', title)
+    title = re.sub(r'^\d+\s+[AB]BY\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)
     title = re.sub(r'^\d+(?:\.\d+)?\s*[\-\.]?\s*', '', title)
     return title.strip(' -_')
 
@@ -532,6 +544,7 @@ def process_book(
     use_folder   = 'unknown' in raw_album.lower() or len(book_dir.name) > len(raw_album) + 8
     early_title  = clean_title(book_dir.name if use_folder else raw_album)
     early_author = normalise_author(raw_artist)
+    early_title  = strip_author_from_title(early_title, early_author)
 
     check_title = strip_author_prefix(early_title.lower()) if ' - ' in early_title else early_title.lower()
 

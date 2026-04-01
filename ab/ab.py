@@ -941,20 +941,20 @@ def process_book(
 
         if not auto_lookup:
             _flush_stdin()
-            raw = input("    Move to output? [Y/n]: ").strip().lower()
+            raw = input("    Copy to output? [Y/n]: ").strip().lower()
             if raw not in ('', 'y', 'yes'):
                 print("[~] Skipping.")
                 log.info(f"Skipped (user declined): {book_dir.name}")
                 return
 
         if dry_run:
-            print(f"[~] Dry run — would move to: {output_file}")
-            log.info(f"Dry run: would move {files[0].name} → {output_filename}")
+            print(f"[~] Dry run — would copy to: {output_file}")
+            log.info(f"Dry run: would copy {files[0].name} → {output_filename}")
             return
 
-        shutil.move(str(files[0]), str(output_file))
-        print(f"[+] Moved: {output_file.name}")
-        log.info(f"Moved: {files[0].name}  →  {output_filename}")
+        shutil.copy2(str(files[0]), str(output_file))
+        print(f"[+] Copied: {output_file.name}")
+        log.info(f"Copied: {files[0].name}  →  {output_filename}")
         if existing_stems is not None:
             existing_stems.append(strip_author_prefix(output_file.stem.lower()))
         return

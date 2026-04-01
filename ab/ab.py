@@ -10,6 +10,7 @@ Usage:
 """
 
 import html
+import logging
 import os
 import re
 import sys
@@ -20,6 +21,7 @@ import tempfile
 import urllib.request
 import urllib.parse
 import termios
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
@@ -49,6 +51,26 @@ STRUCTURAL_FOLDER_RE = re.compile(
     r'|^(unabridged|abridged|mp3|audiobooks?)$',
     flags=re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+log = logging.getLogger('ab')
+
+
+def setup_logging(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter(
+        '%(asctime)s  %(levelname)-7s  %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    fh = logging.FileHandler(log_path, encoding='utf-8')
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    log.setLevel(logging.DEBUG)
+    log.info(f"Log file: {log_path}")
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -478,6 +500,7 @@ def interactive_lookup(
             flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
             series_tag = f"  [{res['series']}]" if res.get('series') else ''
             print(f"    [+] Auto-selected: {res['title']}{series_tag}  score={score:.2f}  {flags}")
+            log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}  score={score:.2f}{flags}")
             return res['title'], res['author'], res['cover_url'], res['desc'], False
 
         if (
@@ -488,6 +511,7 @@ def interactive_lookup(
             flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
             series_tag = f"  [{res['series']}]" if res.get('series') else ''
             print(f"    [+] Auto-selecting match: {res['title']}{series_tag}  {flags}")
+            log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}{flags}")
             return res['title'], res['author'], res['cover_url'], res['desc'], False
 
         print("\n" + "=" * 60 + "\n ONLINE RESULTS (best match first)\n" + "=" * 60)
@@ -513,15 +537,20 @@ def interactive_lookup(
                 continue
             choice = int(raw)
             if 1 <= choice <= n:
-                s = results[choice - 1]
+                s          = results[choice - 1]
+                series_tag = f"  [{s['series']}]" if s.get('series') else ''
+                score      = _score_result(s, title, norm_author)
+                log.info(f"Metadata [{s['source']}]: \"{s['title']}\" by {s['author']}{series_tag}  score={score:.2f}")
                 return s['title'], s['author'], s['cover_url'], s['desc'], False
             elif choice == skip_opt:
+                log.info(f"Metadata [local]: \"{title}\" by {norm_author}")
                 return title, norm_author, None, '', False
             elif choice == manual_opt:
                 new_title  = input("    New title: ").strip() or title
                 new_author = input("    New author (blank = keep): ").strip() or norm_author
                 return interactive_lookup(new_title, new_author, auto_lookup=False, no_lookup=False)
             elif choice == abort_opt:
+                log.warning(f"Aborted by user")
                 return None, None, None, None, True
         except (ValueError, EOFError):
             pass
@@ -659,6 +688,7 @@ def process_book(
     print(f"\n{'=' * 60}")
     print(f"  Audiobook: {book_dir.name}")
     print(f"{'=' * 60}")
+    log.info(f"--- {book_dir.name}  ({len(files)} file(s))")
 
     files = sorted(files, key=lambda f: natural_sort_key(f))
 
@@ -680,6 +710,7 @@ def process_book(
         print(f"[?] Checking for existing file matching: '{check_title}' …")
         if already_exists(check_title, existing_stems):
             print("[!] Match found in output folder — skipping.")
+            log.info(f"Skipped (duplicate): {book_dir.name}")
             return
         print("[*] No match found. Proceeding …")
 
@@ -700,6 +731,7 @@ def process_book(
 
     if not track_data:
         print("[!] No valid audio files found. Skipping.")
+        log.warning(f"No valid audio files: {book_dir.name}")
         return
 
     book_title, book_author, cover_url, book_desc, abort = interactive_lookup(
@@ -717,12 +749,14 @@ def process_book(
 
     if output_file.exists():
         print("[!] Output file already exists — skipping.")
+        log.info(f"Skipped (exists): {output_filename}")
         if existing_stems is not None:
             existing_stems.append(strip_author_prefix(output_file.stem.lower()))
         return
 
     if dry_run:
         print("[~] Dry run — nothing written.")
+        log.info(f"Dry run: would create {output_filename}")
         return
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -770,6 +804,7 @@ def process_book(
                 print("[!] Some files failed to transcode:")
                 for err in transcode_errors:
                     print(f"    {err}")
+                    log.error(f"Transcode: {err}")
         else:
             print("    [+] Source is already AAC — stream copying (no re-encode).")
             for t in track_data:
@@ -830,9 +865,11 @@ def process_book(
             run_ffmpeg_with_progress(cmd, total_sec, task_name='Assembling')
         except RuntimeError as e:
             print(f"\n[!] Assembly failed: {e}")
+            log.error(f"Assembly failed: {e}")
             return
 
     print(f"[+] Created: {output_file.name}")
+    log.info(f"Created: {output_file.name}  ({len(track_data)} track(s), {'stream-copy' if can_copy else bitrate})")
 
     if existing_stems is not None:
         existing_stems.append(strip_author_prefix(output_file.stem.lower()))
@@ -852,6 +889,7 @@ def main():
     parser.add_argument('-n', '--dry-run', action='store_true', help='Scan and report without writing files')
     parser.add_argument('--auto-lookup',   action='store_true', help='Auto-select the top metadata result')
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')
+    parser.add_argument('--log', metavar='FILE', help='Log file path (default: ab_TIMESTAMP.log in output dir)')
     args = parser.parse_args()
 
     in_p  = Path(args.input).resolve()
@@ -861,16 +899,24 @@ def main():
         print(f"[!] Input path does not exist or is not a directory: {in_p}")
         sys.exit(1)
 
-    if not args.dry_run:
-        out_p.mkdir(parents=True, exist_ok=True)
+    out_p.mkdir(parents=True, exist_ok=True)
+
+    log_path = Path(args.log) if args.log else out_p / f"ab_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    setup_logging(log_path)
+    log.info(f"Input:  {in_p}")
+    log.info(f"Output: {out_p}")
+    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}")
+    print(f"[*] Logging to: {log_path}")
 
     books = find_audiobooks(in_p)
 
     if not books:
         print("[!] No audiobook folders found.")
+        log.info("No audiobook folders found.")
         sys.exit(0)
 
     print(f"[*] Found {len(books)} audiobook folder(s).")
+    log.info(f"Found {len(books)} audiobook folder(s)")
 
     existing_stems = build_existing_stems(out_p) if not args.dry_run else []
 
@@ -884,6 +930,7 @@ def main():
             existing_stems=existing_stems,
         )
 
+    log.info("Done")
     print("\n[+] All done.")
 
 

@@ -745,8 +745,11 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     CLIP_SEC    = 20   # seconds of audio to examine after each silence
     MIN_SPACING = 120  # ignore silence gaps within 2 min of the previous kept candidate
 
+    log.debug(f"Chapterize: source={audio_file.name}  clip_sec={CLIP_SEC}  min_spacing={MIN_SPACING}s")
+
     print("    [~] Finding silence gaps …")
     silence_ends = _find_silence_ends(audio_file)
+    log.debug(f"Chapterize: {len(silence_ends)} raw silence gap(s) found")
 
     # Always check t=0; then keep only candidates spaced MIN_SPACING apart to
     # skip intra-paragraph silences that can't be chapter breaks.
@@ -757,10 +760,15 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
             candidates.append(ts)
 
     skipped = len(raw_candidates) - len(candidates)
+    log.debug(f"Chapterize: {len(candidates)} candidate(s) after spacing filter  ({skipped} dropped)")
     print(f"    [~] {len(candidates)} candidate(s) to scan "
           f"({skipped} skipped — closer than {MIN_SPACING}s to previous) …")
 
     model = vosk.Model(model_path)
+
+    # Use half the CPU count to leave headroom; ffmpeg + Vosk together are heavy
+    max_workers = max(1, (os.cpu_count() or 2) // 2)
+    log.debug(f"Chapterize: {max_workers} parallel worker(s)")
 
     # --- worker: extract one clip and run Vosk ----------------------------
     def _scan_clip(ts: float) -> tuple[float, list]:
@@ -771,7 +779,10 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
             '-i', str(audio_file),
             '-ar', '16000', '-ac', '1', '-f', 'wav', str(wav_path),
         ]
-        if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            err = result.stderr.decode(errors='replace').strip()
+            log.debug(f"Chapterize: clip extraction failed at {ts:.1f}s — {err or 'no stderr'}")
             return ts, []
 
         rec = vosk.KaldiRecognizer(model, 16000)
@@ -787,6 +798,11 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
                     words.extend(json.loads(rec.Result()).get('result', []))
         words.extend(json.loads(rec.FinalResult()).get('result', []))
         wav_path.unlink(missing_ok=True)
+
+        if words:
+            transcript = ' '.join(w.get('word', '') for w in words[:12])
+            log.debug(f"Chapterize: {ts:.1f}s → \"{transcript}{'…' if len(words) > 12 else ''}\"")
+
         return ts, words
 
     # --- run workers in parallel, updating a shared progress counter ------
@@ -794,9 +810,6 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     n_done    = 0
     done_lock = threading.Lock()
     raw_results: list[tuple[float, list]] = []
-
-    # Use half the CPU count to leave headroom; ffmpeg + Vosk together are heavy
-    max_workers = max(1, (os.cpu_count() or 2) // 2)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {pool.submit(_scan_clip, ts): ts for ts in candidates}
@@ -811,6 +824,7 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
             print(f"\r    [~] Scanned {d}/{n_total}  (last: {h_ts:02d}:{m_ts:02d}:{s_ts:02d})", end='', flush=True)
 
     print()  # newline after progress line
+    log.debug(f"Chapterize: all {n_total} clip(s) scanned")
 
     # --- parse results in timestamp order; deduplicate chapter numbers -----
     raw_results.sort(key=lambda x: x[0])
@@ -826,6 +840,7 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
 
             if word in _STANDALONE_MARKERS:
                 chapters.append((word_ts, word.capitalize()))
+                log.debug(f"Chapterize: standalone marker '{word}' at {word_ts:.1f}s")
                 break
 
             next_words = [words[j].get('word', '').lower() for j in range(i + 1, min(i + 4, len(words)))]
@@ -839,9 +854,12 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
                     break
             if num and num not in seen_nums:
                 seen_nums.add(num)
-                chapters.append((word_ts, f"{word.capitalize()} {num}"))
+                title = f"{word.capitalize()} {num}"
+                chapters.append((word_ts, title))
+                log.debug(f"Chapterize: '{title}' at {word_ts:.1f}s")
                 break
 
+    log.debug(f"Chapterize: {len(chapters)} chapter(s) found after deduplication")
     chapters.sort(key=lambda c: c[0])
     return chapters
 

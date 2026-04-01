@@ -2,11 +2,14 @@
 """
 audiobook_converter.py
 Converts directories of audio files into a single chaptered .m4b audiobook file.
-Fetches metadata and cover art from iTunes, Google Books, and Open Library.
+Fetches metadata and cover art from iTunes, Google Books, Open Library, and Audnexus.
+Embeds series, narrator, cover art, and description into the output .m4b.
+Optionally detects chapter boundaries via speech recognition (--chapterize, requires vosk).
 
 Usage:
     python audiobook_converter.py <input_dir> [-o <output_dir>] [-b <bitrate>]
                                   [--auto-lookup] [--no-lookup] [--dry-run]
+                                  [--chapterize]
 """
 
 import html
@@ -293,6 +296,7 @@ def _search_itunes(query: str) -> list:
                 'desc':      strip_html(item.get('description', '')),
                 'source':    'iTunes',
                 'series':    '',
+                'narrator':  '',
             }
             for item in data.get('results', [])
         ]
@@ -316,6 +320,7 @@ def _search_google_books(query: str) -> list:
                 'desc':      strip_html(vol.get('description', '')),
                 'source':    'Google Books',
                 'series':    '',
+                'narrator':  '',
             })
         return results
     except Exception:
@@ -341,6 +346,7 @@ def _search_open_library(query: str) -> list:
                 'desc':      '',   # search endpoint doesn't return descriptions
                 'source':    'Open Library',
                 'series':    '',
+                'narrator':  '',
             })
         return results
     except Exception:
@@ -366,6 +372,8 @@ def _search_audnexus(title: str, author: str) -> list:
                 s_title    = s.get('title', '')
                 s_pos      = s.get('position', '')
                 series_str = f"{s_title} #{s_pos}" if s_pos else s_title
+            narrators    = item.get('narrators', [])
+            narrator_str = narrators[0].get('name', '') if narrators else ''
             out.append({
                 'title':     clean_title(item.get('title', 'Unknown')),
                 'author':    author_str,
@@ -374,6 +382,7 @@ def _search_audnexus(title: str, author: str) -> list:
                 'desc':      strip_html(item.get('summary', '')),
                 'source':    'Audnexus',
                 'series':    series_str,
+                'narrator':  narrator_str,
             })
         return out
     except Exception:
@@ -475,10 +484,10 @@ def interactive_lookup(
 ) -> tuple:
     """
     Interactively (or automatically) select metadata for a book.
-    Returns (title, author, cover_url, description, aborted).
+    Returns (title, author, cover_url, description, series, narrator, aborted).
     """
     if no_lookup:
-        return title, author, None, '', False
+        return title, author, None, '', '', '', False
 
     _flush_stdin()
     norm_author = normalise_author(author)
@@ -489,19 +498,20 @@ def interactive_lookup(
         print("    [!] No results found online.")
         if auto_lookup:
             print("    [~] Auto-lookup: skipping online metadata, using local info.")
-            return title, norm_author, None, '', False
+            return title, norm_author, None, '', '', '', False
     else:
         if auto_lookup:
             res   = results[0]
             score = _score_result(res, title, norm_author)
             if score < 0.40:
                 print(f"    [~] Auto-lookup: best match score {score:.2f} is too low — using local info.")
-                return title, norm_author, None, '', False
+                return title, norm_author, None, '', '', '', False
             flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
             series_tag = f"  [{res['series']}]" if res.get('series') else ''
-            print(f"    [+] Auto-selected: {res['title']}{series_tag}  score={score:.2f}  {flags}")
-            log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}  score={score:.2f}{flags}")
-            return res['title'], res['author'], res['cover_url'], res['desc'], False
+            narrator_tag = f"  (narrated by {res['narrator']})" if res.get('narrator') else ''
+            print(f"    [+] Auto-selected: {res['title']}{series_tag}{narrator_tag}  score={score:.2f}  {flags}")
+            log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}{narrator_tag}  score={score:.2f}{flags}")
+            return res['title'], res['author'], res['cover_url'], res['desc'], res.get('series', ''), res.get('narrator', ''), False
 
         if (
             len(results) == 1
@@ -510,18 +520,20 @@ def interactive_lookup(
             res   = results[0]
             flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
             series_tag = f"  [{res['series']}]" if res.get('series') else ''
-            print(f"    [+] Auto-selecting match: {res['title']}{series_tag}  {flags}")
-            log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}{flags}")
-            return res['title'], res['author'], res['cover_url'], res['desc'], False
+            narrator_tag = f"  (narrated by {res['narrator']})" if res.get('narrator') else ''
+            print(f"    [+] Auto-selecting match: {res['title']}{series_tag}{narrator_tag}  {flags}")
+            log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}{narrator_tag}{flags}")
+            return res['title'], res['author'], res['cover_url'], res['desc'], res.get('series', ''), res.get('narrator', ''), False
 
         print("\n" + "=" * 60 + "\n ONLINE RESULTS (best match first)\n" + "=" * 60)
         for i, res in enumerate(results, 1):
-            flags = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
-            score = _score_result(res, title, norm_author)
-            series_tag = f"  [{res['series']}]" if res.get('series') else ''
+            flags        = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
+            score        = _score_result(res, title, norm_author)
+            series_tag   = f"  [{res['series']}]" if res.get('series') else ''
+            narrator_tag = f"  (narrated by {res['narrator']})" if res.get('narrator') else ''
             print(
                 f"  {i}) [{res['source']:12s}] {res['title']}{series_tag} ({res['year']}) "
-                f"— {res['author']}  {flags}  score={score:.2f}"
+                f"— {res['author']}{narrator_tag}  {flags}  score={score:.2f}"
             )
 
     n = len(results)
@@ -537,21 +549,22 @@ def interactive_lookup(
                 continue
             choice = int(raw)
             if 1 <= choice <= n:
-                s          = results[choice - 1]
-                series_tag = f"  [{s['series']}]" if s.get('series') else ''
-                score      = _score_result(s, title, norm_author)
-                log.info(f"Metadata [{s['source']}]: \"{s['title']}\" by {s['author']}{series_tag}  score={score:.2f}")
-                return s['title'], s['author'], s['cover_url'], s['desc'], False
+                s            = results[choice - 1]
+                series_tag   = f"  [{s['series']}]" if s.get('series') else ''
+                narrator_tag = f"  (narrated by {s['narrator']})" if s.get('narrator') else ''
+                score        = _score_result(s, title, norm_author)
+                log.info(f"Metadata [{s['source']}]: \"{s['title']}\" by {s['author']}{series_tag}{narrator_tag}  score={score:.2f}")
+                return s['title'], s['author'], s['cover_url'], s['desc'], s.get('series', ''), s.get('narrator', ''), False
             elif choice == skip_opt:
                 log.info(f"Metadata [local]: \"{title}\" by {norm_author}")
-                return title, norm_author, None, '', False
+                return title, norm_author, None, '', '', '', False
             elif choice == manual_opt:
                 new_title  = input("    New title: ").strip() or title
                 new_author = input("    New author (blank = keep): ").strip() or norm_author
                 return interactive_lookup(new_title, new_author, auto_lookup=False, no_lookup=False)
             elif choice == abort_opt:
                 log.warning(f"Aborted by user")
-                return None, None, None, None, True
+                return None, None, None, None, None, None, True
         except (ValueError, EOFError):
             pass
 
@@ -672,6 +685,133 @@ def build_existing_stems(output_dir: Path) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Speech-based chapter detection
+# ---------------------------------------------------------------------------
+
+_ORDINALS = {
+    'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
+    'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10',
+    'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
+    'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+    'first': '1', 'second': '2', 'third': '3', 'fourth': '4', 'fifth': '5',
+    'sixth': '6', 'seventh': '7', 'eighth': '8', 'ninth': '9', 'tenth': '10',
+}
+
+_STANDALONE_MARKERS = frozenset({
+    'prologue', 'epilogue', 'interlude', 'afterword', 'foreword',
+    'introduction', 'preface', 'postscript',
+})
+
+_CHAPTER_WORDS = frozenset({'chapter', 'part', 'book'}) | _STANDALONE_MARKERS
+
+
+def _find_silence_ends(audio_file: Path, noise_db: int = -40, min_dur: float = 1.0) -> list[float]:
+    """Return timestamps (seconds) where silence ends — potential chapter start points."""
+    cmd = [
+        'ffmpeg', '-nostdin', '-loglevel', 'quiet',
+        '-i', str(audio_file),
+        '-af', f'silencedetect=noise={noise_db}dB:d={min_dur}',
+        '-f', 'null', '-',
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return [float(m.group(1)) for m in re.finditer(r'silence_end: (\d+\.?\d*)', result.stderr)]
+
+
+def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, str]]:
+    """
+    Scan an audio file for spoken chapter markers using vosk speech recognition.
+    Only analyses short clips after silence gaps, so it's fast even for long books.
+
+    Returns a sorted list of (start_seconds, chapter_title) tuples.
+    Requires: pip install vosk  +  a vosk model at ~/.vosk/model or $VOSK_MODEL.
+    """
+    try:
+        import vosk
+        import wave
+    except ImportError:
+        print("    [!] vosk not installed — run: pip install vosk")
+        return []
+
+    model_path = os.environ.get('VOSK_MODEL') or os.path.expanduser('~/.vosk/model')
+    if not os.path.isdir(model_path):
+        print(f"    [!] Vosk model not found at: {model_path}")
+        print(f"        Download a model from https://alphacephei.com/vosk/models")
+        print(f"        and place (or symlink) it at ~/.vosk/model  (or set $VOSK_MODEL)")
+        return []
+
+    print("    [~] Finding silence gaps …")
+    silence_ends = _find_silence_ends(audio_file)
+    # Always include t=0 so the very start of the file is checked too
+    candidates = sorted({0.0} | set(silence_ends))
+    print(f"    [~] Scanning {len(candidates)} candidate position(s) for chapter markers …")
+
+    model  = vosk.Model(model_path)
+    chapters: list[tuple[float, str]] = []
+    seen_nums: set = set()
+    CLIP_SEC = 20  # seconds of audio to examine after each silence
+
+    for ts in candidates:
+        wav_path = tmpdir / f'clip_{int(ts * 1000):012d}.wav'
+        # Extract a short mono 16kHz clip starting at ts
+        cmd = [
+            'ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
+            '-ss', str(ts), '-t', str(CLIP_SEC),
+            '-i', str(audio_file),
+            '-ar', '16000', '-ac', '1', '-f', 'wav', str(wav_path),
+        ]
+        if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
+            continue
+
+        rec = vosk.KaldiRecognizer(model, 16000)
+        rec.SetWords(True)
+        words = []
+        with open(wav_path, 'rb') as wf:
+            # Skip wav header (44 bytes)
+            wf.read(44)
+            while True:
+                data = wf.read(8000)
+                if not data:
+                    break
+                if rec.AcceptWaveform(data):
+                    result_json = json.loads(rec.Result())
+                    words.extend(result_json.get('result', []))
+        final = json.loads(rec.FinalResult())
+        words.extend(final.get('result', []))
+        wav_path.unlink(missing_ok=True)
+
+        for i, w in enumerate(words):
+            word = w.get('word', '').lower()
+            if word not in _CHAPTER_WORDS:
+                continue
+            # Timestamp relative to the file, not the clip
+            word_ts = ts + w.get('start', 0)
+
+            if word in _STANDALONE_MARKERS:
+                title = word.capitalize()
+                chapters.append((word_ts, title))
+                break
+
+            # "chapter / part / book" — look for a following number
+            next_words = [words[j].get('word', '').lower() for j in range(i + 1, min(i + 4, len(words)))]
+            num = None
+            for nw in next_words:
+                if nw.isdigit():
+                    num = nw
+                    break
+                if nw in _ORDINALS:
+                    num = _ORDINALS[nw]
+                    break
+            if num and num not in seen_nums:
+                seen_nums.add(num)
+                title = f"{word.capitalize()} {num}"
+                chapters.append((word_ts, title))
+                break
+
+    chapters.sort(key=lambda c: c[0])
+    return chapters
+
+
+# ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
 
@@ -684,6 +824,7 @@ def process_book(
     auto_lookup: bool = False,
     no_lookup: bool = False,
     existing_stems: list | None = None,
+    chapterize: bool = False,
 ):
     print(f"\n{'=' * 60}")
     print(f"  Audiobook: {book_dir.name}")
@@ -734,7 +875,7 @@ def process_book(
         log.warning(f"No valid audio files: {book_dir.name}")
         return
 
-    book_title, book_author, cover_url, book_desc, abort = interactive_lookup(
+    book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
         early_title, early_author, auto_lookup, no_lookup,
     )
     if abort:
@@ -813,6 +954,24 @@ def process_book(
         total_sec = sum(t['duration'] for t in track_data)
         curr_ms   = 0
 
+        # Speech-based chapter detection for single-file audiobooks
+        speech_chapters: list[tuple[float, str]] = []
+        if chapterize and len(track_data) == 1 and track_data[0]['path'].suffix.lower() != '.m4b':
+            print("    [~] Running speech chapter detection …")
+            detected = detect_chapters_speech(track_data[0]['path'], tmp)
+            if detected:
+                print(f"    [+] Detected {len(detected)} chapter marker(s):")
+                for ch_ts, ch_title in detected:
+                    m, s = divmod(int(ch_ts), 60)
+                    h, m = divmod(m, 60)
+                    print(f"        {h:02d}:{m:02d}:{s:02d}  {ch_title}")
+                _flush_stdin()
+                raw = input("    Use these chapters? [Y/n]: ").strip().lower()
+                if raw in ('', 'y', 'yes'):
+                    speech_chapters = detected
+            else:
+                print("    [!] No chapter markers detected via speech recognition.")
+
         with open(concat_list, 'w', encoding='utf-8') as fc, \
              open(meta_file,   'w', encoding='utf-8') as fm:
 
@@ -821,21 +980,41 @@ def process_book(
             fm.write(f"artist={_ffmeta_escape(book_author)}\n")
             fm.write(f"album={_ffmeta_escape(book_title)}\n")
             fm.write("genre=Audiobook\n")
+            if book_series:
+                fm.write(f"grouping={_ffmeta_escape(book_series)}\n")
+            if book_narrator:
+                fm.write(f"composer={_ffmeta_escape(book_narrator)}\n")
+                print(f"    [+] Narrator: {book_narrator}")
             if book_desc:
                 desc_escaped = _ffmeta_escape(book_desc)
                 fm.write(f"comment={desc_escaped}\n")
                 fm.write(f"description={desc_escaped}\n")
             fm.write('\n')
 
-            for i, t in enumerate(track_data):
-                safe_path     = str(t['target']).replace('\\', '\\\\').replace("'", "\\'")
+            if speech_chapters:
+                # Single file — write chapters from speech detection timestamps
+                safe_path = str(track_data[0]['target']).replace('\\', '\\\\').replace("'", "\\'")
                 fc.write(f"file '{safe_path}'\n")
-                dur_ms        = int(t['duration'] * 1000)
-                chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
-                fm.write(f"[CHAPTER]\nTIMEBASE=1/1000\n")
-                fm.write(f"START={curr_ms}\nEND={curr_ms + dur_ms}\n")
-                fm.write(f"title={_ffmeta_escape(chapter_title)}\n\n")
-                curr_ms += dur_ms
+                total_ms = int(total_sec * 1000)
+                for idx, (ch_ts, ch_title) in enumerate(speech_chapters):
+                    start_ms = int(ch_ts * 1000)
+                    if idx + 1 < len(speech_chapters):
+                        end_ms = int(speech_chapters[idx + 1][0] * 1000)
+                    else:
+                        end_ms = total_ms
+                    fm.write(f"[CHAPTER]\nTIMEBASE=1/1000\n")
+                    fm.write(f"START={start_ms}\nEND={end_ms}\n")
+                    fm.write(f"title={_ffmeta_escape(ch_title)}\n\n")
+            else:
+                for i, t in enumerate(track_data):
+                    safe_path     = str(t['target']).replace('\\', '\\\\').replace("'", "\\'")
+                    fc.write(f"file '{safe_path}'\n")
+                    dur_ms        = int(t['duration'] * 1000)
+                    chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
+                    fm.write(f"[CHAPTER]\nTIMEBASE=1/1000\n")
+                    fm.write(f"START={curr_ms}\nEND={curr_ms + dur_ms}\n")
+                    fm.write(f"title={_ffmeta_escape(chapter_title)}\n\n")
+                    curr_ms += dur_ms
 
         cmd = [
             'ffmpeg', '-y', '-nostdin',
@@ -889,6 +1068,7 @@ def main():
     parser.add_argument('-n', '--dry-run', action='store_true', help='Scan and report without writing files')
     parser.add_argument('--auto-lookup',   action='store_true', help='Auto-select the top metadata result')
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')
+    parser.add_argument('--chapterize',    action='store_true', help='Detect chapters via speech recognition for single-file audiobooks (requires vosk + model)')
     parser.add_argument('--log', metavar='FILE', help='Log file path (default: ab_TIMESTAMP.log in output dir)')
     args = parser.parse_args()
 
@@ -905,7 +1085,7 @@ def main():
     setup_logging(log_path)
     log.info(f"Input:  {in_p}")
     log.info(f"Output: {out_p}")
-    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}")
+    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}")
     print(f"[*] Logging to: {log_path}")
 
     books = find_audiobooks(in_p)
@@ -928,6 +1108,7 @@ def main():
             auto_lookup=args.auto_lookup,
             no_lookup=args.no_lookup,
             existing_stems=existing_stems,
+            chapterize=args.chapterize,
         )
 
     log.info("Done")

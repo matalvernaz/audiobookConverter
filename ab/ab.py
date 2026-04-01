@@ -24,6 +24,7 @@ import tempfile
 import urllib.request
 import urllib.parse
 import termios
+import threading
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -722,12 +723,14 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     Scan an audio file for spoken chapter markers using vosk speech recognition.
     Only analyses short clips after silence gaps, so it's fast even for long books.
 
+    Candidates are filtered to a minimum spacing to skip intra-paragraph silences,
+    then processed in parallel (Vosk releases the GIL so threads run truly concurrently).
+
     Returns a sorted list of (start_seconds, chapter_title) tuples.
     Requires: pip install vosk  +  a vosk model at ~/.vosk/model or $VOSK_MODEL.
     """
     try:
         import vosk
-        import wave
     except ImportError:
         print("    [!] vosk not installed — run: pip install vosk")
         return []
@@ -739,23 +742,29 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
         print(f"        and place (or symlink) it at ~/.vosk/model  (or set $VOSK_MODEL)")
         return []
 
+    CLIP_SEC    = 20   # seconds of audio to examine after each silence
+    MIN_SPACING = 120  # ignore silence gaps within 2 min of the previous kept candidate
+
     print("    [~] Finding silence gaps …")
     silence_ends = _find_silence_ends(audio_file)
-    # Always include t=0 so the very start of the file is checked too
-    candidates = sorted({0.0} | set(silence_ends))
-    print(f"    [~] Scanning {len(candidates)} candidate position(s) for chapter markers …")
 
-    model  = vosk.Model(model_path)
-    chapters: list[tuple[float, str]] = []
-    seen_nums: set = set()
-    CLIP_SEC = 20  # seconds of audio to examine after each silence
+    # Always check t=0; then keep only candidates spaced MIN_SPACING apart to
+    # skip intra-paragraph silences that can't be chapter breaks.
+    raw_candidates = sorted({0.0} | set(silence_ends))
+    candidates: list[float] = [raw_candidates[0]]
+    for ts in raw_candidates[1:]:
+        if ts - candidates[-1] >= MIN_SPACING:
+            candidates.append(ts)
 
-    for idx, ts in enumerate(candidates, 1):
-        m_ts, s_ts = divmod(int(ts), 60)
-        h_ts, m_ts = divmod(m_ts, 60)
-        print(f"\r    [~] Candidate {idx}/{len(candidates)}  ({h_ts:02d}:{m_ts:02d}:{s_ts:02d})", end='', flush=True)
+    skipped = len(raw_candidates) - len(candidates)
+    print(f"    [~] {len(candidates)} candidate(s) to scan "
+          f"({skipped} skipped — closer than {MIN_SPACING}s to previous) …")
+
+    model = vosk.Model(model_path)
+
+    # --- worker: extract one clip and run Vosk ----------------------------
+    def _scan_clip(ts: float) -> tuple[float, list]:
         wav_path = tmpdir / f'clip_{int(ts * 1000):012d}.wav'
-        # Extract a short mono 16kHz clip starting at ts
         cmd = [
             'ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
             '-ss', str(ts), '-t', str(CLIP_SEC),
@@ -763,38 +772,62 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
             '-ar', '16000', '-ac', '1', '-f', 'wav', str(wav_path),
         ]
         if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
-            continue
+            return ts, []
 
         rec = vosk.KaldiRecognizer(model, 16000)
         rec.SetWords(True)
         words = []
         with open(wav_path, 'rb') as wf:
-            # Skip wav header (44 bytes)
-            wf.read(44)
+            wf.read(44)  # skip WAV header
             while True:
                 data = wf.read(8000)
                 if not data:
                     break
                 if rec.AcceptWaveform(data):
-                    result_json = json.loads(rec.Result())
-                    words.extend(result_json.get('result', []))
-        final = json.loads(rec.FinalResult())
-        words.extend(final.get('result', []))
+                    words.extend(json.loads(rec.Result()).get('result', []))
+        words.extend(json.loads(rec.FinalResult()).get('result', []))
         wav_path.unlink(missing_ok=True)
+        return ts, words
 
+    # --- run workers in parallel, updating a shared progress counter ------
+    n_total   = len(candidates)
+    n_done    = 0
+    done_lock = threading.Lock()
+    raw_results: list[tuple[float, list]] = []
+
+    # Use half the CPU count to leave headroom; ffmpeg + Vosk together are heavy
+    max_workers = max(1, (os.cpu_count() or 2) // 2)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(_scan_clip, ts): ts for ts in candidates}
+        for future in as_completed(future_map):
+            ts, words = future.result()
+            raw_results.append((ts, words))
+            with done_lock:
+                n_done += 1
+                d = n_done
+            m_ts, s_ts = divmod(int(ts), 60)
+            h_ts, m_ts = divmod(m_ts, 60)
+            print(f"\r    [~] Scanned {d}/{n_total}  (last: {h_ts:02d}:{m_ts:02d}:{s_ts:02d})", end='', flush=True)
+
+    print()  # newline after progress line
+
+    # --- parse results in timestamp order; deduplicate chapter numbers -----
+    raw_results.sort(key=lambda x: x[0])
+    chapters: list[tuple[float, str]] = []
+    seen_nums: set = set()
+
+    for ts, words in raw_results:
         for i, w in enumerate(words):
             word = w.get('word', '').lower()
             if word not in _CHAPTER_WORDS:
                 continue
-            # Timestamp relative to the file, not the clip
             word_ts = ts + w.get('start', 0)
 
             if word in _STANDALONE_MARKERS:
-                title = word.capitalize()
-                chapters.append((word_ts, title))
+                chapters.append((word_ts, word.capitalize()))
                 break
 
-            # "chapter / part / book" — look for a following number
             next_words = [words[j].get('word', '').lower() for j in range(i + 1, min(i + 4, len(words)))]
             num = None
             for nw in next_words:
@@ -806,11 +839,9 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
                     break
             if num and num not in seen_nums:
                 seen_nums.add(num)
-                title = f"{word.capitalize()} {num}"
-                chapters.append((word_ts, title))
+                chapters.append((word_ts, f"{word.capitalize()} {num}"))
                 break
 
-    print()  # newline after progress line
     chapters.sort(key=lambda c: c[0])
     return chapters
 

@@ -750,7 +750,10 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     seen_nums: set = set()
     CLIP_SEC = 20  # seconds of audio to examine after each silence
 
-    for ts in candidates:
+    for idx, ts in enumerate(candidates, 1):
+        m_ts, s_ts = divmod(int(ts), 60)
+        h_ts, m_ts = divmod(m_ts, 60)
+        print(f"\r    [~] Candidate {idx}/{len(candidates)}  ({h_ts:02d}:{m_ts:02d}:{s_ts:02d})", end='', flush=True)
         wav_path = tmpdir / f'clip_{int(ts * 1000):012d}.wav'
         # Extract a short mono 16kHz clip starting at ts
         cmd = [
@@ -807,6 +810,7 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
                 chapters.append((word_ts, title))
                 break
 
+    print()  # newline after progress line
     chapters.sort(key=lambda c: c[0])
     return chapters
 
@@ -1063,19 +1067,26 @@ def process_book(
         speech_chapters: list[tuple[float, str]] = []
         if chapterize and len(track_data) == 1 and track_data[0]['path'].suffix.lower() != '.m4b':
             print("    [~] Running speech chapter detection …")
+            log.info("Chapterize: starting speech detection")
             detected = detect_chapters_speech(track_data[0]['path'], tmp)
             if detected:
                 print(f"    [+] Detected {len(detected)} chapter marker(s):")
+                log.info(f"Chapterize: detected {len(detected)} chapter marker(s)")
                 for ch_ts, ch_title in detected:
                     m, s = divmod(int(ch_ts), 60)
                     h, m = divmod(m, 60)
                     print(f"        {h:02d}:{m:02d}:{s:02d}  {ch_title}")
+                    log.info(f"Chapterize:   {h:02d}:{m:02d}:{s:02d}  {ch_title}")
                 _flush_stdin()
                 raw = input("    Use these chapters? [Y/n]: ").strip().lower()
                 if raw in ('', 'y', 'yes'):
                     speech_chapters = detected
+                    log.info("Chapterize: chapters accepted by user")
+                else:
+                    log.info("Chapterize: chapters rejected by user")
             else:
                 print("    [!] No chapter markers detected via speech recognition.")
+                log.info("Chapterize: no chapter markers detected")
 
         with open(concat_list, 'w', encoding='utf-8') as fc, \
              open(meta_file,   'w', encoding='utf-8') as fm:

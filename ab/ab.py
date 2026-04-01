@@ -913,35 +913,6 @@ def process_book(
     early_author = normalise_author(raw_artist)
     early_title  = strip_author_from_title(early_title, early_author)
 
-    # --- Single .m4b: already converted -----------------------------------
-    if len(files) == 1 and files[0].suffix.lower() == '.m4b':
-        if not auto_lookup:
-            print("[~] Already a single .m4b — skipping.")
-            log.info(f"Skipped (already .m4b): {book_dir.name}")
-            return
-        # With --auto-lookup: show current tags and ask the user to confirm.
-        print(f"[*] Already a single .m4b: {files[0].name}")
-        print(f"    Title:  {early_title}")
-        print(f"    Author: {early_author}")
-        _flush_stdin()
-        raw = input("    Metadata correct? [Y/n]: ").strip().lower()
-        if raw in ('', 'y', 'yes'):
-            print("[~] Metadata confirmed — skipping.")
-            log.info(f"Skipped (metadata confirmed): {book_dir.name}")
-            return
-        book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
-            early_title, early_author, auto_lookup=False, no_lookup=False,
-        )
-        if abort:
-            print("[!] Aborted.")
-            return
-        if dry_run:
-            print(f"[~] Dry run — would retag as: {book_title} by {book_author}")
-            return
-        retag_m4b(files[0], book_title, book_author, cover_url, book_desc, book_series, book_narrator)
-        return
-    # ----------------------------------------------------------------------
-
     check_title = strip_author_prefix(early_title.lower()) if ' - ' in early_title else early_title.lower()
 
     if existing_stems is not None:
@@ -951,6 +922,43 @@ def process_book(
             log.info(f"Skipped (duplicate): {book_dir.name}")
             return
         print("[*] No match found. Proceeding …")
+
+    # --- Single .m4b: already converted -----------------------------------
+    if len(files) == 1 and files[0].suffix.lower() == '.m4b':
+        import shutil
+        safe_author     = truncate_author(early_author)
+        output_filename = safe_filename(safe_author, early_title)
+        output_file     = output_dir / output_filename
+
+        if output_file.exists():
+            print("[!] Output file already exists — skipping.")
+            log.info(f"Skipped (exists): {output_filename}")
+            return
+
+        print(f"[*] Single .m4b: {files[0].name}")
+        print(f"    Title:  {early_title}")
+        print(f"    Author: {early_author}")
+
+        if not auto_lookup:
+            _flush_stdin()
+            raw = input("    Move to output? [Y/n]: ").strip().lower()
+            if raw not in ('', 'y', 'yes'):
+                print("[~] Skipping.")
+                log.info(f"Skipped (user declined): {book_dir.name}")
+                return
+
+        if dry_run:
+            print(f"[~] Dry run — would move to: {output_file}")
+            log.info(f"Dry run: would move {files[0].name} → {output_filename}")
+            return
+
+        shutil.move(str(files[0]), str(output_file))
+        print(f"[+] Moved: {output_file.name}")
+        log.info(f"Moved: {files[0].name}  →  {output_filename}")
+        if existing_stems is not None:
+            existing_stems.append(strip_author_prefix(output_file.stem.lower()))
+        return
+    # ----------------------------------------------------------------------
 
     print(f"[*] Probing {len(files)} file(s) …")
     track_data: list = []

@@ -811,6 +811,74 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     return chapters
 
 
+def retag_m4b(
+    source_file: Path,
+    book_title: str,
+    book_author: str,
+    cover_url: str | None,
+    book_desc: str,
+    book_series: str = '',
+    book_narrator: str = '',
+) -> bool:
+    """Overwrite metadata tags on an existing .m4b in-place (stream-copy, no re-encode)."""
+    import shutil
+    tmp_out = source_file.with_suffix('.retag.m4b')
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp       = Path(tmpdir)
+        meta_file = tmp / 'metadata.txt'
+        cover_file = None
+
+        if cover_url:
+            try:
+                cover_file = tmp / 'cover.jpg'
+                req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as r, open(cover_file, 'wb') as out:
+                    out.write(r.read())
+                print("    [+] Cover art downloaded.")
+            except Exception as e:
+                print(f"    [!] Cover art download failed: {e}")
+                cover_file = None
+
+        with open(meta_file, 'w', encoding='utf-8') as fm:
+            fm.write(';FFMETADATA1\n')
+            fm.write(f"title={_ffmeta_escape(book_title)}\n")
+            fm.write(f"artist={_ffmeta_escape(book_author)}\n")
+            fm.write(f"album={_ffmeta_escape(book_title)}\n")
+            fm.write("genre=Audiobook\n")
+            if book_series:
+                fm.write(f"grouping={_ffmeta_escape(book_series)}\n")
+            if book_narrator:
+                fm.write(f"composer={_ffmeta_escape(book_narrator)}\n")
+            if book_desc:
+                desc_escaped = _ffmeta_escape(book_desc)
+                fm.write(f"comment={desc_escaped}\n")
+                fm.write(f"description={desc_escaped}\n")
+
+        cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
+               '-i', str(source_file), '-i', str(meta_file)]
+        if cover_file and cover_file.exists():
+            cmd += ['-i', str(cover_file),
+                    '-map', '0:a', '-map', '2:0',
+                    '-c:v', 'mjpeg', '-disposition:v:0', 'attached_pic']
+        else:
+            cmd += ['-map', '0:a']
+        cmd += ['-map_metadata', '1', '-map_chapters', '0',
+                '-c:a', 'copy', '-movflags', '+faststart', str(tmp_out)]
+
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            print(f"[!] Retag failed: {result.stderr.decode(errors='replace').strip()}")
+            if tmp_out.exists():
+                tmp_out.unlink()
+            return False
+
+    shutil.move(str(tmp_out), str(source_file))
+    print(f"[+] Retagged in place: {source_file.name}")
+    log.info(f"Retagged: {source_file.name}  →  {book_title} by {book_author}")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
@@ -844,6 +912,35 @@ def process_book(
     early_title  = clean_title(book_dir.name if use_folder else raw_album)
     early_author = normalise_author(raw_artist)
     early_title  = strip_author_from_title(early_title, early_author)
+
+    # --- Single .m4b: already converted -----------------------------------
+    if len(files) == 1 and files[0].suffix.lower() == '.m4b':
+        if not auto_lookup:
+            print("[~] Already a single .m4b — skipping.")
+            log.info(f"Skipped (already .m4b): {book_dir.name}")
+            return
+        # With --auto-lookup: show current tags and ask the user to confirm.
+        print(f"[*] Already a single .m4b: {files[0].name}")
+        print(f"    Title:  {early_title}")
+        print(f"    Author: {early_author}")
+        _flush_stdin()
+        raw = input("    Metadata correct? [Y/n]: ").strip().lower()
+        if raw in ('', 'y', 'yes'):
+            print("[~] Metadata confirmed — skipping.")
+            log.info(f"Skipped (metadata confirmed): {book_dir.name}")
+            return
+        book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
+            early_title, early_author, auto_lookup=False, no_lookup=False,
+        )
+        if abort:
+            print("[!] Aborted.")
+            return
+        if dry_run:
+            print(f"[~] Dry run — would retag as: {book_title} by {book_author}")
+            return
+        retag_m4b(files[0], book_title, book_author, cover_url, book_desc, book_series, book_narrator)
+        return
+    # ----------------------------------------------------------------------
 
     check_title = strip_author_prefix(early_title.lower()) if ' - ' in early_title else early_title.lower()
 

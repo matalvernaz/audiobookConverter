@@ -217,60 +217,114 @@ def strip_html(text: str) -> str:
 # Metadata search — result scoring
 # ---------------------------------------------------------------------------
 
+_STOP_WORDS = frozenset({
+    'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'but',
+    'with', 'by', 'from', 'is', 'it', 'its', 'as', 'be', 'was', 'are', 'were',
+    'that', 'this', 'not', 'no', 'so', 'up', 'do', 'if',
+})
+
+
+def _content_words(text: str) -> set:
+    """Lowercase words minus stop words and non-alpha tokens."""
+    return {w for w in re.sub(r"[^a-z0-9 ]", '', text.lower()).split()
+            if w and w not in _STOP_WORDS}
+
+
+def _jaccard(a_words: set, b_words: set) -> float:
+    if not a_words or not b_words:
+        return 0.0
+    return len(a_words & b_words) / len(a_words | b_words)
+
+
 def _similarity(a: str, b: str) -> float:
+    """Character-level similarity (kept for the single-result auto-select check)."""
     return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+
+def _title_variants(title: str) -> list[str]:
+    variants = [title]
+    if ' - ' in title:
+        after = title.split(' - ', 1)[1].strip()
+        if after:
+            variants.append(after)
+        before = title.split(' - ', 1)[0].strip()
+        if before and before not in variants:
+            variants.append(before)
+    if ':' in title:
+        primary = title.split(':', 1)[0].strip()
+        if len(primary) > 5 and primary not in variants:
+            variants.append(primary)
+    return variants
+
+
+def _author_last_name(name: str) -> str:
+    name = name.strip()
+    if ',' in name:
+        return name.split(',', 1)[0].strip().lower()
+    parts = name.split()
+    return parts[-1].lower() if parts else ''
 
 
 def _score_result(result: dict, query_title: str, query_author: str) -> float:
     """
     Return a 0–1 score for how well a metadata result matches the query.
-    Title similarity is weighted more heavily than author similarity.
-    Cover art and a description give a small quality bonus.
 
-    Title scoring uses the BEST match across combinations of:
-      - query variants: full title, and the part after the first ' - '
-        (the bare book title when a series prefix is present)
-      - result variants: full title, and the part before the first ':'
-        (the primary title when a subtitle/series qualifier follows)
+    Title score: best Jaccard word-overlap across query/result title variants.
+    For short titles (<3 content words) blend 50/50 with SequenceMatcher so that
+    single-word titles like "Abhorsen" still match well.
 
-    This lets "Series 01 - BookTitle" correctly match "BookTitle: Series Qualifier"
-    even when the long forms score poorly against each other.
+    Keyword anchor: if the query title has content words, at least one of the
+    most-distinctive query words must appear somewhere in the result metadata
+    (title + series + description). Results that share no content words at all
+    with the query are capped at 0.30.
 
-    When the author is unknown the score is based on title only, since adding
-    "Unknown Author" to the author weight only penalises the score unfairly.
+    Author: full-name Jaccard, with a last-name-only fallback when the full
+    match is weak.
+
+    Quality bonus: small reward for results that have cover art / description.
     """
-    rt            = result.get('title', '')
+    rt            = result.get('title', '') or ''
     quality_bonus = (0.02 if result.get('cover_url') else 0) + (0.02 if result.get('desc') else 0)
 
-    # Build title variants
-    q_variants = [query_title]
-    if ' - ' in query_title:
-        short = query_title.split(' - ', 1)[1].strip()
-        if short:
-            q_variants.append(short)
+    q_variants = _title_variants(query_title)
+    rt_variants = _title_variants(rt)
 
-    rt_variants = [rt]
-    if ':' in rt:
-        primary = rt.split(':', 1)[0].strip()
-        if len(primary) > 5:
-            rt_variants.append(primary)
-    if ' - ' in rt:
-        last_seg = rt.rsplit(' - ', 1)[1].strip()
-        if len(last_seg) > 5 and last_seg not in rt_variants:
-            rt_variants.append(last_seg)
+    # Word-overlap (Jaccard) across all variant pairs
+    best_jaccard = max(
+        _jaccard(_content_words(qv), _content_words(rv))
+        for qv in q_variants for rv in rt_variants
+    )
 
-    ts = max(_similarity(qv, rv) for qv in q_variants for rv in rt_variants)
-    # Small tiebreaker: reward results whose full title matches the full query well.
-    # This helps when many books share the same short title (e.g. "Invincible") —
-    # the one whose full title also contains the series context scores slightly higher.
-    full_bonus = _similarity(query_title, rt) * 0.01
+    # For very short titles blend with character-level similarity
+    q_words = _content_words(query_title)
+    if len(q_words) < 3:
+        best_char = max(
+            _similarity(qv, rv) for qv in q_variants for rv in rt_variants
+        )
+        ts = 0.5 * best_jaccard + 0.5 * best_char
+    else:
+        ts = best_jaccard
 
+    # Keyword anchor: cap weak matches that share no content words
+    result_blob = ' '.join(filter(None, [rt, result.get('series', ''), result.get('desc', '')]))
+    result_words = _content_words(result_blob)
+    if q_words and not (q_words & result_words):
+        ts = min(ts, 0.30)
+
+    # Author scoring
     is_unknown = query_author.lower() in ('', 'unknown', 'unknown author')
     if is_unknown:
-        return ts + full_bonus + quality_bonus
+        return ts + quality_bonus
 
-    author_score = _similarity(query_author, result.get('author', ''))
-    return ts * 0.65 + author_score * 0.33 + full_bonus + quality_bonus
+    ra = result.get('author', '') or ''
+    author_full  = _jaccard(_content_words(query_author), _content_words(ra))
+    # Last-name fallback: if full-name match is weak, try last-name only
+    q_last = _author_last_name(query_author)
+    r_last = _author_last_name(ra)
+    author_last  = 1.0 if (q_last and r_last and q_last == r_last) else 0.0
+    author_score = max(author_full, author_last * 0.8)
+
+    return ts * 0.65 + author_score * 0.33 + quality_bonus
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +570,7 @@ def interactive_lookup(
 
         if (
             len(results) == 1
-            and SequenceMatcher(None, title.lower(), results[0]['title'].lower()).ratio() > 0.85
+            and _score_result(results[0], title, norm_author) >= 0.55
         ):
             res   = results[0]
             flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
@@ -1263,7 +1317,7 @@ def main():
     print(f"[*] Found {len(books)} audiobook folder(s).")
     log.info(f"Found {len(books)} audiobook folder(s)")
 
-    existing_stems = build_existing_stems(out_p) if not args.dry_run else []
+    existing_stems = build_existing_stems(out_p)
 
     for book_dir, book_files in sorted(books.items(), key=lambda kv: natural_sort_key(kv[0])):
         process_book(

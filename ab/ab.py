@@ -145,6 +145,7 @@ def clean_title(title: str) -> str:
     title = re.sub(r'^\d+(?:\.\d+)\s+', '', title)          # "12.5 Side Jobs" (decimal prefix with space)
     title = re.sub(r'^0*\d{1,2}\s+(?=[A-Z])', '', title)    # "01 Monsters" but not "1984"
     title = re.sub(r'^\s*[A-Z]{1,5}-\d+\s*[-–]\s*', '', title)  # series codes exposed after number strip
+    title = re.sub(r'\s*\[[A-Z]{1,4}\]', '', title)            # short bracket tags: [L], [FQ], [MP3]
     return title.strip(' -_.')
 
 
@@ -330,6 +331,11 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
     r_last = _author_last_name(ra)
     author_last  = 1.0 if (q_last and r_last and q_last == r_last) else 0.0
     author_score = max(author_full, author_last * 0.8)
+
+    # When author is known but matches zero words, penalise heavily — a perfect
+    # title with the wrong author is likely a different book entirely.
+    if ra and author_score == 0:
+        return ts * 0.35 + quality_bonus
 
     return ts * 0.65 + author_score * 0.33 + quality_bonus
 
@@ -768,7 +774,7 @@ _STANDALONE_MARKERS = frozenset({
 _CHAPTER_WORDS = frozenset({'chapter', 'part', 'book'}) | _STANDALONE_MARKERS
 
 
-def _find_silence_ends(audio_file: Path, noise_db: int = -40, min_dur: float = 1.0) -> list[float]:
+def _find_silence_ends(audio_file: Path, noise_db: int = -30, min_dur: float = 0.5) -> list[float]:
     """Return timestamps (seconds) where silence ends — potential chapter start points."""
     cmd = [
         'ffmpeg', '-nostdin', '-loglevel', 'quiet',

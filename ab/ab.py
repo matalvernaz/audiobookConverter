@@ -111,7 +111,11 @@ def strip_author_from_title(title: str, author: str) -> str:
     if not author or author.lower() in ('unknown author', 'unknown'):
         return title
     if title.lower().startswith(author.lower()):
-        stripped = title[len(author):].strip(' -_')
+        rest = title[len(author):]
+        # Only strip if author is followed by a separator, not mid-word/possessive
+        if rest and rest[0] not in (' ', '-', '_', '\t'):
+            return title
+        stripped = rest.strip(' -_')
         if stripped:
             return stripped
     return title
@@ -120,9 +124,9 @@ def strip_author_from_title(title: str, author: str) -> str:
 def clean_title(title: str) -> str:
     title = re.sub(r'\s*[\[\(]?(disc|disk|cd|part|volume|vol)\s*\d+[\]\)]?', '', title, flags=re.IGNORECASE)
     title = re.sub(
-        r'\s*[\[\(]?(unabridged|abridged|unb\b|isis audio ?books?|corgi audio|bbc radio|'
+        r'\s*[\[\(]?(?:unabridged|abridged|unb\b|isis audio ?books?|corgi audio|bbc radio|'
         r'podium|audible studios|listening library|macmillan audio|tantor|brilliance audio|'
-        r'full[ -]cast drama|full cast|\d{2,3}br|vbr|mp3|m4b)[\]\)]?',
+        r'full[ -]cast drama|full cast|\d{2,3}br|vbr|mp3|m4b)(?:[- ]\d+)?[\]\)]?',
         '', title, flags=re.IGNORECASE,
     )
     title = re.sub(r'\s*[\(\[]?\d{1,2}/\d{1,2}/\d{2,4}.*?[\)\]]?', '', title)
@@ -133,11 +137,14 @@ def clean_title(title: str) -> str:
     title = re.sub(r'^\s*[A-Z]{1,5}-\d+\s*[-–]\s*', '', title)                    # series codes e.g. MR-02 -
     title = re.sub(r'([a-zA-Z])\d{1,2}(?=\s+-\s)', r'\1', title)                  # strip number embedded in series name: Flamel02 → Flamel
     title = re.sub(r'\s+[A-Z]\.\s*[A-Z][a-z]+\.?\s*$', '', title)                 # trailing narrator J.Johnson
-    title = re.sub(r'^\d+[.\s]+(?=\d)', '', title)
+    title = re.sub(r'^\d+\.\s+(?=\d)', '', title)             # "04. 3954 BBY" but not "12.5 Side Jobs"
     title = re.sub(r'^\d+\s+[AB]BY\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)
     title = re.sub(r'^Year\s+\d+(?:\s*[-–]\s*\d+)?\s*[-–—]\s*', '', title, flags=re.IGNORECASE)  # Year 36 -, Year 12-13 -
     title = re.sub(r'^Book\s+[Tt]he\s+\d+(?:st|nd|rd|th)\s*[-–—]?\s*', '', title, flags=re.IGNORECASE)  # Book The 1st-, Book the 2nd -
-    title = re.sub(r'^\d+(?:\.\d+)?\s*[\-\.]?\s*', '', title)
+    title = re.sub(r'^\d+(?:\.\d+)?\s*[\-\.]\s+', '', title)  # "01 - Title" / "12.5 - Title" but not bare "1984"
+    title = re.sub(r'^\d+(?:\.\d+)\s+', '', title)          # "12.5 Side Jobs" (decimal prefix with space)
+    title = re.sub(r'^0*\d{1,2}\s+(?=[A-Z])', '', title)    # "01 Monsters" but not "1984"
+    title = re.sub(r'^\s*[A-Z]{1,5}-\d+\s*[-–]\s*', '', title)  # series codes exposed after number strip
     return title.strip(' -_.')
 
 
@@ -680,7 +687,8 @@ def probe_file(filepath: Path):
                            ),
             'album':       tags.get('album', 'Unknown Audiobook'),
         }
-    except Exception:
+    except Exception as e:
+        log.warning(f"probe_file failed for {filepath.name}: {e}")
         return None
 
 
@@ -1033,8 +1041,16 @@ def process_book(
     # --- Single .m4b: already converted -----------------------------------
     if len(files) == 1 and files[0].suffix.lower() == '.m4b':
         import shutil
-        safe_author     = truncate_author(early_author)
-        output_filename = safe_filename(safe_author, early_title)
+
+        book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
+            early_title, early_author, auto_lookup, no_lookup,
+        )
+        if abort:
+            print("[!] Aborted by user.")
+            return
+
+        safe_author     = truncate_author(book_author)
+        output_filename = safe_filename(safe_author, book_title)
         output_file     = output_dir / output_filename
 
         if output_file.exists():
@@ -1043,16 +1059,8 @@ def process_book(
             return
 
         print(f"[*] Single .m4b: {files[0].name}")
-        print(f"    Title:  {early_title}")
-        print(f"    Author: {early_author}")
-
-        if not auto_lookup:
-            _flush_stdin()
-            raw = input("    Copy to output? [Y/n]: ").strip().lower()
-            if raw not in ('', 'y', 'yes'):
-                print("[~] Skipping.")
-                log.info(f"Skipped (user declined): {book_dir.name}")
-                return
+        print(f"    Title:  {book_title}")
+        print(f"    Author: {book_author}")
 
         if dry_run:
             print(f"[~] Dry run — would copy to: {output_file}")
@@ -1062,6 +1070,11 @@ def process_book(
         shutil.copy2(str(files[0]), str(output_file))
         print(f"[+] Copied: {output_file.name}")
         log.info(f"Copied: {files[0].name}  →  {output_filename}")
+
+        has_metadata = cover_url or book_desc or book_series or book_narrator
+        if has_metadata:
+            retag_m4b(output_file, book_title, book_author, cover_url, book_desc, book_series, book_narrator)
+
         if existing_stems is not None:
             existing_stems.append(strip_author_prefix(output_file.stem.lower()))
         return
@@ -1098,6 +1111,14 @@ def process_book(
     output_filename = safe_filename(safe_author, book_title)
     output_file     = output_dir / output_filename
 
+    # Re-check duplicates with the final (post-lookup) title
+    if existing_stems is not None:
+        final_check = strip_author_prefix(book_title.lower()) if ' - ' in book_title else book_title.lower()
+        if final_check != check_title and already_exists(final_check, existing_stems):
+            print(f"[!] Post-lookup title '{book_title}' matches an existing file — skipping.")
+            log.info(f"Skipped (duplicate after lookup): {book_dir.name}")
+            return
+
     print(f"[*] Output: {output_file}")
 
     if output_file.exists():
@@ -1131,7 +1152,8 @@ def process_book(
 
         codecs       = {t['codec'] for t in track_data}
         sample_rates = {t['sample_rate'] for t in track_data}
-        can_copy     = (codecs == {'aac'} and len(sample_rates) == 1)
+        channels     = {t['channels'] for t in track_data}
+        can_copy     = (codecs == {'aac'} and len(sample_rates) == 1 and len(channels) == 1)
 
         if not can_copy:
             print(f"    [~] Transcoding {len(track_data)} chapter(s) to AAC {bitrate} …")

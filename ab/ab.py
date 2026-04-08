@@ -16,6 +16,7 @@ import html
 import logging
 import os
 import re
+import shutil
 import sys
 import json
 import subprocess
@@ -36,6 +37,40 @@ from html.parser import HTMLParser
 # ---------------------------------------------------------------------------
 
 AUDIO_EXTS = {'.mp3', '.m4a', '.m4b', '.aac', '.ogg', '.opus', '.flac', '.wav', '.wma'}
+
+DEFAULT_BITRATE = '192k'
+DEFAULT_WHISPER_MODEL = 'medium'
+API_TIMEOUT = 6
+API_SEARCH_LIMIT = 5
+METADATA_SEARCH_TIMEOUT = 15          # max seconds to wait for all metadata APIs
+
+# Scoring weights and thresholds
+SCORE_TITLE_WEIGHT = 0.65             # how much title match contributes to score
+SCORE_AUTHOR_WEIGHT = 0.33            # how much author match contributes to score
+SCORE_AUTHOR_MISMATCH_WEIGHT = 0.35   # title weight when author doesn't match at all
+SCORE_LAST_NAME_FALLBACK = 0.8        # multiplier for last-name-only author match
+SCORE_QUALITY_COVER_BONUS = 0.02      # bonus for having cover art
+SCORE_QUALITY_DESC_BONUS = 0.02       # bonus for having a description
+SCORE_AUTO_SELECT_THRESHOLD = 0.55    # minimum score to auto-select a result
+SCORE_SINGLE_RESULT_THRESHOLD = 0.55  # minimum score to auto-select when only one result
+SCORE_KEYWORD_ANCHOR_CAP = 0.30       # cap when no query words appear in result
+SHORT_TITLE_WORD_COUNT = 3            # titles with fewer words blend Jaccard + char similarity
+TITLE_VARIANT_MIN_LEN = 5             # min chars for colon-split primary variant
+
+# Duplicate detection thresholds
+DUPE_WORD_THRESHOLD = 0.85
+DUPE_SEQ_THRESHOLD = 0.90
+
+# Chapterize settings
+CHAPTERIZE_CLIP_SEC = 20              # seconds of audio to examine after each silence
+CHAPTERIZE_MIN_SPACING = 120          # ignore silence gaps within 2 min of previous candidate
+SILENCE_NOISE_DB = -30                # noise floor for silence detection
+SILENCE_MIN_DURATION = 0.5            # minimum silence duration in seconds
+
+# Folder name heuristic: prefer folder name over album tag when album is short
+FOLDER_NAME_MIN_ADVANTAGE = 8        # folder must be this many chars longer than album
+
+MAX_AUTHOR_LEN = 50                   # truncation limit for author in filenames
 
 _PLACEHOLDER_ARTISTS = frozenset({
     'artist', 'unknown', 'unknown author', 'unknown artist',
@@ -89,7 +124,7 @@ def title_words(s: str) -> set:
     return words - STOPWORDS
 
 
-def titles_match(a: str, b: str, word_threshold: float = 0.85, seq_threshold: float = 0.90) -> bool:
+def titles_match(a: str, b: str, word_threshold: float = DUPE_WORD_THRESHOLD, seq_threshold: float = DUPE_SEQ_THRESHOLD) -> bool:
     words_a = title_words(a)
     words_b = title_words(b)
     if words_a and words_b:
@@ -159,7 +194,7 @@ def safe_filename(author: str, title: str) -> str:
     return f"{re.sub(forbidden, '', author)} - {re.sub(forbidden, '', title)}.m4b"
 
 
-def truncate_author(author: str, max_len: int = 50) -> str:
+def truncate_author(author: str, max_len: int = MAX_AUTHOR_LEN) -> str:
     if len(author) <= max_len and ',' not in author:
         return author
     primary = author.split(',')[0].split('&')[0].split(' and ')[0].strip()
@@ -260,7 +295,7 @@ def _title_variants(title: str) -> list[str]:
             variants.append(before)
     if ':' in title:
         primary = title.split(':', 1)[0].strip()
-        if len(primary) > 5 and primary not in variants:
+        if len(primary) > TITLE_VARIANT_MIN_LEN and primary not in variants:
             variants.append(primary)
     return variants
 
@@ -292,7 +327,7 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
     Quality bonus: small reward for results that have cover art / description.
     """
     rt            = result.get('title', '') or ''
-    quality_bonus = (0.02 if result.get('cover_url') else 0) + (0.02 if result.get('desc') else 0)
+    quality_bonus = (SCORE_QUALITY_COVER_BONUS if result.get('cover_url') else 0) + (SCORE_QUALITY_DESC_BONUS if result.get('desc') else 0)
 
     q_variants = _title_variants(query_title)
     rt_variants = _title_variants(rt)
@@ -305,7 +340,7 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
 
     # For very short titles blend with character-level similarity
     q_words = _content_words(query_title)
-    if len(q_words) < 3:
+    if len(q_words) < SHORT_TITLE_WORD_COUNT:
         best_char = max(
             _similarity(qv, rv) for qv in q_variants for rv in rt_variants
         )
@@ -317,7 +352,7 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
     result_blob = ' '.join(filter(None, [rt, result.get('series', ''), result.get('desc', '')]))
     result_words = _content_words(result_blob)
     if q_words and not (q_words & result_words):
-        ts = min(ts, 0.30)
+        ts = min(ts, SCORE_KEYWORD_ANCHOR_CAP)
 
     # Author scoring
     is_unknown = query_author.lower() in ('', 'unknown', 'unknown author')
@@ -330,21 +365,21 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
     q_last = _author_last_name(query_author)
     r_last = _author_last_name(ra)
     author_last  = 1.0 if (q_last and r_last and q_last == r_last) else 0.0
-    author_score = max(author_full, author_last * 0.8)
+    author_score = max(author_full, author_last * SCORE_LAST_NAME_FALLBACK)
 
     # When author is known but matches zero words, penalise heavily — a perfect
     # title with the wrong author is likely a different book entirely.
     if ra and author_score == 0:
-        return ts * 0.35 + quality_bonus
+        return ts * SCORE_AUTHOR_MISMATCH_WEIGHT + quality_bonus
 
-    return ts * 0.65 + author_score * 0.33 + quality_bonus
+    return ts * SCORE_TITLE_WEIGHT + author_score * SCORE_AUTHOR_WEIGHT + quality_bonus
 
 
 # ---------------------------------------------------------------------------
 # Metadata sources
 # ---------------------------------------------------------------------------
 
-def _fetch_json(url: str, timeout: int = 6) -> dict:
+def _fetch_json(url: str, timeout: int = API_TIMEOUT) -> dict:
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
@@ -353,7 +388,7 @@ def _fetch_json(url: str, timeout: int = 6) -> dict:
 def _search_itunes(query: str) -> list:
     try:
         data = _fetch_json(
-            f"https://itunes.apple.com/search?term={query}&media=audiobook&limit=5"
+            f"https://itunes.apple.com/search?term={query}&media=audiobook&limit={API_SEARCH_LIMIT}"
         )
         return [
             {
@@ -375,7 +410,7 @@ def _search_itunes(query: str) -> list:
 def _search_google_books(query: str) -> list:
     try:
         data = _fetch_json(
-            f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults=5"
+            f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults={API_SEARCH_LIMIT}"
         )
         results = []
         for item in data.get('items', []):
@@ -400,7 +435,7 @@ def _search_open_library(query: str) -> list:
     try:
         data = _fetch_json(
             f"https://openlibrary.org/search.json"
-            f"?q={query}&fields=title,author_name,first_publish_year,cover_i&limit=5"
+            f"?q={query}&fields=title,author_name,first_publish_year,cover_i&limit={API_SEARCH_LIMIT}"
         )
         results = []
         for doc in data.get('docs', []):
@@ -427,7 +462,7 @@ def _search_audnexus(title: str, author: str) -> list:
         params = f"title={urllib.parse.quote(title.strip())}"
         if author.strip():
             params += f"&author={urllib.parse.quote(author.strip())}"
-        data  = _fetch_json(f"https://api.audnex.us/books?{params}", timeout=7)
+        data  = _fetch_json(f"https://api.audnex.us/books?{params}", timeout=API_TIMEOUT + 1)
         items = data if isinstance(data, list) else data.get('data', data.get('results', []))
         out   = []
         for item in items:
@@ -486,12 +521,15 @@ def search_metadata(title: str, author: str) -> list:
                 ex.submit(_search_open_library, query),
                 ex.submit(_search_audnexus,     title_q, author_q),
             ]
-            for f in as_completed(futures):
-                for item in f.result():
-                    key = (item['title'].lower(), item['author'].lower())
-                    if key not in seen:
-                        seen.add(key)
-                        combined.append(item)
+            for f in as_completed(futures, timeout=METADATA_SEARCH_TIMEOUT):
+                try:
+                    for item in f.result():
+                        key = (item['title'].lower(), item['author'].lower())
+                        if key not in seen:
+                            seen.add(key)
+                            combined.append(item)
+                except Exception:
+                    pass
 
         return combined
 
@@ -571,7 +609,7 @@ def interactive_lookup(
         if auto_lookup:
             res   = results[0]
             score = _score_result(res, title, norm_author)
-            if score < 0.40:
+            if score < SCORE_AUTO_SELECT_THRESHOLD:
                 print(f"    [~] Auto-lookup: best match score {score:.2f} is too low — using local info.")
                 return title, norm_author, None, '', '', '', False
             flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
@@ -583,7 +621,7 @@ def interactive_lookup(
 
         if (
             len(results) == 1
-            and _score_result(results[0], title, norm_author) >= 0.55
+            and _score_result(results[0], title, norm_author) >= SCORE_SINGLE_RESULT_THRESHOLD
         ):
             res   = results[0]
             flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
@@ -774,7 +812,7 @@ _STANDALONE_MARKERS = frozenset({
 _CHAPTER_WORDS = frozenset({'chapter', 'part', 'book'}) | _STANDALONE_MARKERS
 
 
-def _find_silence_ends(audio_file: Path, noise_db: int = -30, min_dur: float = 0.5) -> list[float]:
+def _find_silence_ends(audio_file: Path, noise_db: int = SILENCE_NOISE_DB, min_dur: float = SILENCE_MIN_DURATION) -> list[float]:
     """Return timestamps (seconds) where silence ends — potential chapter start points."""
     cmd = [
         'ffmpeg', '-nostdin', '-loglevel', 'quiet',
@@ -803,9 +841,9 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
         print("    [!] faster-whisper not installed — run: pip install faster-whisper")
         return []
 
-    CLIP_SEC    = 20   # seconds of audio to examine after each silence
-    MIN_SPACING = 120  # ignore silence gaps within 2 min of the previous kept candidate
-    MODEL_SIZE  = os.environ.get('WHISPER_MODEL', 'small')
+    CLIP_SEC    = CHAPTERIZE_CLIP_SEC
+    MIN_SPACING = CHAPTERIZE_MIN_SPACING
+    MODEL_SIZE  = os.environ.get('WHISPER_MODEL', DEFAULT_WHISPER_MODEL)
 
     log.debug(f"Chapterize: source={audio_file.name}  clip_sec={CLIP_SEC}  min_spacing={MIN_SPACING}s  model={MODEL_SIZE}")
 
@@ -910,6 +948,19 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     return chapters
 
 
+def _download_cover(cover_url: str, dest: Path) -> Path | None:
+    """Download cover art to dest. Returns the path on success, None on failure."""
+    try:
+        req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r, open(dest, 'wb') as out:
+            out.write(r.read())
+        print("    [+] Cover art downloaded.")
+        return dest
+    except Exception as e:
+        print(f"    [!] Cover art download failed: {e}")
+        return None
+
+
 def retag_m4b(
     source_file: Path,
     book_title: str,
@@ -920,7 +971,6 @@ def retag_m4b(
     book_narrator: str = '',
 ) -> bool:
     """Overwrite metadata tags on an existing .m4b in-place (stream-copy, no re-encode)."""
-    import shutil
     tmp_out = source_file.with_suffix('.retag.m4b')
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -929,15 +979,7 @@ def retag_m4b(
         cover_file = None
 
         if cover_url:
-            try:
-                cover_file = tmp / 'cover.jpg'
-                req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=10) as r, open(cover_file, 'wb') as out:
-                    out.write(r.read())
-                print("    [+] Cover art downloaded.")
-            except Exception as e:
-                print(f"    [!] Cover art download failed: {e}")
-                cover_file = None
+            cover_file = _download_cover(cover_url, tmp / 'cover.jpg')
 
         with open(meta_file, 'w', encoding='utf-8') as fm:
             fm.write(';FFMETADATA1\n')
@@ -1007,7 +1049,7 @@ def process_book(
     # Only prefer the folder name when the album tag is absent, a placeholder,
     # or very short (< 15 chars) — avoids using noisy folder names over clean
     # album tags that happen to be shorter (e.g. "Album" vs "Album - NoisySuffix").
-    use_folder   = 'unknown' in raw_album.lower() or (len(raw_album) < 15 and len(book_dir.name) > len(raw_album) + 8)
+    use_folder   = 'unknown' in raw_album.lower() or (len(raw_album) < 15 and len(book_dir.name) > len(raw_album) + FOLDER_NAME_MIN_ADVANTAGE)
     early_title  = clean_title(book_dir.name if use_folder else raw_album)
     early_author = normalise_author(raw_artist)
     early_title  = strip_author_from_title(early_title, early_author)
@@ -1024,8 +1066,6 @@ def process_book(
 
     # --- Single .m4b: already converted -----------------------------------
     if len(files) == 1 and files[0].suffix.lower() == '.m4b':
-        import shutil
-
         book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
             early_title, early_author, auto_lookup, no_lookup,
         )
@@ -1124,15 +1164,7 @@ def process_book(
         cover_file  = None
 
         if cover_url:
-            try:
-                cover_file = tmp / 'cover.jpg'
-                req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=10) as r, open(cover_file, 'wb') as out:
-                    out.write(r.read())
-                print("    [+] Cover art downloaded.")
-            except Exception as e:
-                print(f"    [!] Cover art download failed: {e}")
-                cover_file = None
+            cover_file = _download_cover(cover_url, tmp / 'cover.jpg')
 
         codecs       = {t['codec'] for t in track_data}
         sample_rates = {t['sample_rate'] for t in track_data}
@@ -1289,7 +1321,7 @@ def main():
     )
     parser.add_argument('input',           help='Input directory containing audiobook folders')
     parser.add_argument('-o', '--output',  default='.', help='Output directory (default: current dir)')
-    parser.add_argument('-b', '--bitrate', default='192k', help='AAC bitrate for transcoding (default: 192k)')
+    parser.add_argument('-b', '--bitrate', default=DEFAULT_BITRATE, help=f'AAC bitrate for transcoding (default: {DEFAULT_BITRATE})')
     parser.add_argument('-n', '--dry-run', action='store_true', help='Scan and report without writing files')
     parser.add_argument('--auto-lookup',   action='store_true', help='Auto-select the top metadata result')
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')

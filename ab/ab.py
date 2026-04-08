@@ -4,7 +4,7 @@ audiobook_converter.py
 Converts directories of audio files into a single chaptered .m4b audiobook file.
 Fetches metadata and cover art from iTunes, Google Books, Open Library, and Audnexus.
 Embeds series, narrator, cover art, and description into the output .m4b.
-Optionally detects chapter boundaries via speech recognition (--chapterize, requires vosk).
+Optionally detects chapter boundaries via speech recognition (--chapterize, requires faster-whisper).
 
 Usage:
     python audiobook_converter.py <input_dir> [-o <output_dir>] [-b <bitrate>]
@@ -782,32 +782,26 @@ def _find_silence_ends(audio_file: Path, noise_db: int = -40, min_dur: float = 1
 
 def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, str]]:
     """
-    Scan an audio file for spoken chapter markers using vosk speech recognition.
+    Scan an audio file for spoken chapter markers using faster-whisper.
     Only analyses short clips after silence gaps, so it's fast even for long books.
 
     Candidates are filtered to a minimum spacing to skip intra-paragraph silences,
-    then processed in parallel (Vosk releases the GIL so threads run truly concurrently).
+    then processed sequentially through the Whisper model.
 
     Returns a sorted list of (start_seconds, chapter_title) tuples.
-    Requires: pip install vosk  +  a vosk model at ~/.vosk/model or $VOSK_MODEL.
+    Requires: pip install faster-whisper  (model auto-downloads on first use).
     """
     try:
-        import vosk
+        from faster_whisper import WhisperModel
     except ImportError:
-        print("    [!] vosk not installed — run: pip install vosk")
-        return []
-
-    model_path = os.environ.get('VOSK_MODEL') or os.path.expanduser('~/.vosk/model')
-    if not os.path.isdir(model_path):
-        print(f"    [!] Vosk model not found at: {model_path}")
-        print(f"        Download a model from https://alphacephei.com/vosk/models")
-        print(f"        and place (or symlink) it at ~/.vosk/model  (or set $VOSK_MODEL)")
+        print("    [!] faster-whisper not installed — run: pip install faster-whisper")
         return []
 
     CLIP_SEC    = 20   # seconds of audio to examine after each silence
     MIN_SPACING = 120  # ignore silence gaps within 2 min of the previous kept candidate
+    MODEL_SIZE  = os.environ.get('WHISPER_MODEL', 'small')
 
-    log.debug(f"Chapterize: source={audio_file.name}  clip_sec={CLIP_SEC}  min_spacing={MIN_SPACING}s")
+    log.debug(f"Chapterize: source={audio_file.name}  clip_sec={CLIP_SEC}  min_spacing={MIN_SPACING}s  model={MODEL_SIZE}")
 
     print("    [~] Finding silence gaps …")
     silence_ends = _find_silence_ends(audio_file)
@@ -826,14 +820,14 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     print(f"    [~] {len(candidates)} candidate(s) to scan "
           f"({skipped} skipped — closer than {MIN_SPACING}s to previous) …")
 
-    model = vosk.Model(model_path)
+    print(f"    [~] Loading Whisper model '{MODEL_SIZE}' (downloads on first use) …")
+    model = WhisperModel(MODEL_SIZE, device='cpu', compute_type='int8')
 
-    # Use half the CPU count to leave headroom; ffmpeg + Vosk together are heavy
-    max_workers = max(1, (os.cpu_count() or 2) // 2)
-    log.debug(f"Chapterize: {max_workers} parallel worker(s)")
+    # --- extract clips and transcribe sequentially (model is not thread-safe) ---
+    n_total = len(candidates)
+    raw_results: list[tuple[float, list]] = []
 
-    # --- worker: extract one clip and run Vosk ----------------------------
-    def _scan_clip(ts: float) -> tuple[float, list]:
+    for idx, ts in enumerate(candidates):
         wav_path = tmpdir / f'clip_{int(ts * 1000):012d}.wav'
         cmd = [
             'ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
@@ -845,45 +839,29 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
         if result.returncode != 0:
             err = result.stderr.decode(errors='replace').strip()
             log.debug(f"Chapterize: clip extraction failed at {ts:.1f}s — {err or 'no stderr'}")
-            return ts, []
+            raw_results.append((ts, []))
+            continue
 
-        rec = vosk.KaldiRecognizer(model, 16000)
-        rec.SetWords(True)
         words = []
-        with open(wav_path, 'rb') as wf:
-            wf.read(44)  # skip WAV header
-            while True:
-                data = wf.read(8000)
-                if not data:
-                    break
-                if rec.AcceptWaveform(data):
-                    words.extend(json.loads(rec.Result()).get('result', []))
-        words.extend(json.loads(rec.FinalResult()).get('result', []))
+        try:
+            segments, _ = model.transcribe(str(wav_path), word_timestamps=True)
+            for segment in segments:
+                for w in (segment.words or []):
+                    words.append({'word': w.word.strip(), 'start': w.start})
+        except Exception as e:
+            log.debug(f"Chapterize: transcription failed at {ts:.1f}s — {e}")
+
         wav_path.unlink(missing_ok=True)
 
         if words:
-            transcript = ' '.join(w.get('word', '') for w in words[:12])
+            transcript = ' '.join(w['word'] for w in words[:12])
             log.debug(f"Chapterize: {ts:.1f}s → \"{transcript}{'…' if len(words) > 12 else ''}\"")
 
-        return ts, words
+        raw_results.append((ts, words))
 
-    # --- run workers in parallel, updating a shared progress counter ------
-    n_total   = len(candidates)
-    n_done    = 0
-    done_lock = threading.Lock()
-    raw_results: list[tuple[float, list]] = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {pool.submit(_scan_clip, ts): ts for ts in candidates}
-        for future in as_completed(future_map):
-            ts, words = future.result()
-            raw_results.append((ts, words))
-            with done_lock:
-                n_done += 1
-                d = n_done
-            m_ts, s_ts = divmod(int(ts), 60)
-            h_ts, m_ts = divmod(m_ts, 60)
-            print(f"\r    [~] Scanned {d}/{n_total}  (last: {h_ts:02d}:{m_ts:02d}:{s_ts:02d})", end='', flush=True)
+        m_ts, s_ts = divmod(int(ts), 60)
+        h_ts, m_ts = divmod(m_ts, 60)
+        print(f"\r    [~] Scanned {idx + 1}/{n_total}  (last: {h_ts:02d}:{m_ts:02d}:{s_ts:02d})", end='', flush=True)
 
     print()  # newline after progress line
     log.debug(f"Chapterize: all {n_total} clip(s) scanned")
@@ -1309,7 +1287,7 @@ def main():
     parser.add_argument('-n', '--dry-run', action='store_true', help='Scan and report without writing files')
     parser.add_argument('--auto-lookup',   action='store_true', help='Auto-select the top metadata result')
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')
-    parser.add_argument('--chapterize',    action='store_true', help='Detect chapters via speech recognition for single-file audiobooks (requires vosk + model)')
+    parser.add_argument('--chapterize',    action='store_true', help='Detect chapters via speech recognition for single-file audiobooks (requires: pip install faster-whisper)')
     parser.add_argument('--log', metavar='FILE', help='Log file path (default: ab_TIMESTAMP.log in output dir)')
     args = parser.parse_args()
 

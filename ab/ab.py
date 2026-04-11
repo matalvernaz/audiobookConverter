@@ -73,7 +73,7 @@ FOLDER_NAME_MIN_ADVANTAGE = 8        # folder must be this many chars longer tha
 MAX_AUTHOR_LEN = 50                   # truncation limit for author in filenames
 DECISION_CACHE_FILE = '.ab_decisions.json'  # persists interactive choices across restarts
 MAX_TRANSCODE_WORKERS = 2             # cap parallel ffmpeg processes to limit memory on ARM
-COLLECTION_MERGE_MAX_BYTES = 100 * 1024 * 1024   # 100 MB — files larger than this are full novels, not stories
+MERGE_CACHE_PREFIX = 'merge:'                     # decision cache key prefix for folder-merge prompts
 
 _PLACEHOLDER_ARTISTS = frozenset({
     'artist', 'unknown', 'unknown author', 'unknown artist',
@@ -709,7 +709,7 @@ def interactive_lookup(
 # Audiobook discovery
 # ---------------------------------------------------------------------------
 
-def find_audiobooks(input_dir: Path) -> dict:
+def find_audiobooks(input_dir: Path, decision_cache: dict | None = None, cache_path: Path | None = None) -> dict:
     root       = input_dir.resolve()
     all_files  = [p for p in root.rglob('*') if p.suffix.lower() in AUDIO_EXTS]
     books: dict = {}
@@ -727,22 +727,48 @@ def find_audiobooks(input_dir: Path) -> dict:
         print(f"[!] Ignored {loose_count} loose audio file(s) sitting directly in the root folder.")
 
     # Consolidation: when a non-root folder has multiple child folders that
-    # each contain a single audio file, merge them into one book.  This
-    # handles short-story collections split into per-story subfolders
-    # (e.g. "Brief Cases/Story 1/story.mp3", "Brief Cases/Story 2/story.mp3").
+    # each contain a single audio file, ask the user whether to merge them
+    # into one book.  Handles short-story collections split into per-story
+    # subfolders (e.g. "Brief Cases/Story 1/story.mp3").
     parent_groups: dict[Path, list[Path]] = {}
     for book_dir in list(books):
         parent = book_dir.parent
         if parent != root:
             parent_groups.setdefault(parent, []).append(book_dir)
 
-    for parent, children in parent_groups.items():
-        if len(children) > 1 and all(len(books[c]) == 1 for c in children):
-            # Only merge when every file is small enough to be a story/chapter,
-            # not a full-length novel (e.g. a series boxset with one file per book).
-            all_files = [f for c in children for f in books[c]]
-            if any(f.stat().st_size > COLLECTION_MERGE_MAX_BYTES for f in all_files):
-                continue
+    cache = decision_cache or {}
+    for parent, children in sorted(parent_groups.items(), key=lambda kv: natural_sort_key(kv[0])):
+        if len(children) < 2 or not all(len(books[c]) == 1 for c in children):
+            continue
+
+        cache_key = MERGE_CACHE_PREFIX + str(parent)
+        cached = cache.get(cache_key)
+
+        if cached is not None:
+            merge = cached.get('merge', False)
+            if merge:
+                print(f"[*] Merging {len(children)} subfolders under: {parent.name}  (cached)")
+            else:
+                print(f"[*] Keeping {len(children)} subfolders separate under: {parent.name}  (cached)")
+        else:
+            subfolder_names = sorted([c.name for c in children], key=natural_sort_key)
+            print(f"\n{'=' * 60}")
+            print(f"  {parent.name}")
+            print(f"  {len(children)} subfolders, each with 1 audio file:")
+            for name in subfolder_names[:6]:
+                print(f"    • {name}")
+            if len(subfolder_names) > 6:
+                print(f"    … and {len(subfolder_names) - 6} more")
+            print(f"{'=' * 60}")
+            _flush_stdin()
+            raw = input("  Merge into one book? [y/N]: ").strip().lower()
+            merge = raw in ('y', 'yes')
+            if decision_cache is not None and cache_path is not None:
+                _save_decision(cache_path, decision_cache, cache_key, {
+                    'merge': merge, 'timestamp': datetime.now().isoformat(),
+                })
+
+        if merge:
             merged_files: list = []
             for child in children:
                 merged_files.extend(books.pop(child))
@@ -750,7 +776,6 @@ def find_audiobooks(input_dir: Path) -> dict:
                 books[parent].extend(merged_files)
             else:
                 books[parent] = merged_files
-            print(f"[*] Merged {len(children)} single-file subfolders under: {parent.name}")
             log.info(f"Merged {len(children)} single-file subfolder(s) under: {parent.name}")
 
     return books
@@ -1459,7 +1484,7 @@ def main():
         print(f"[*] Loaded {len(decision_cache)} cached decision(s) from previous run.")
         log.info(f"Loaded {len(decision_cache)} cached decision(s)")
 
-    books = find_audiobooks(in_p)
+    books = find_audiobooks(in_p, decision_cache=decision_cache, cache_path=cache_path)
 
     if not books:
         print("[!] No audiobook folders found.")

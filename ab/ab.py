@@ -72,7 +72,7 @@ FOLDER_NAME_MIN_ADVANTAGE = 8        # folder must be this many chars longer tha
 
 MAX_AUTHOR_LEN = 50                   # truncation limit for author in filenames
 DECISION_CACHE_FILE = '.ab_decisions.json'  # persists interactive choices across restarts
-MAX_TRANSCODE_WORKERS = 2             # cap parallel ffmpeg processes to limit memory on ARM
+MAX_TRANSCODE_WORKERS = None          # None = use all CPU cores for parallel transcoding
 MERGE_CACHE_PREFIX = 'merge:'                     # decision cache key prefix for folder-merge prompts
 
 _PLACEHOLDER_ARTISTS = frozenset({
@@ -821,7 +821,7 @@ def probe_file(filepath: Path):
 def transcode_worker(input_path: Path, output_path: Path, bitrate: str) -> Path:
     cmd = [
         'ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
-        '-threads', '2',
+        '-threads', '0',
         '-i', str(input_path),
         '-c:a', 'aac', '-b:a', bitrate,
         '-vn',
@@ -1304,7 +1304,7 @@ def process_book(
         if not can_copy:
             print(f"    [~] Transcoding {len(track_data)} chapter(s) to AAC {bitrate} …")
             transcode_errors = []
-            with ThreadPoolExecutor(max_workers=min(MAX_TRANSCODE_WORKERS, os.cpu_count() or 1)) as xc:
+            with ThreadPoolExecutor(max_workers=MAX_TRANSCODE_WORKERS or (os.cpu_count() or 1)) as xc:
                 future_map = {}
                 for i, t in enumerate(track_data):
                     out = tmp / f"{i:04d}.m4a"

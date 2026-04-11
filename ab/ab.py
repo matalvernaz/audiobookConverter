@@ -73,6 +73,7 @@ FOLDER_NAME_MIN_ADVANTAGE = 8        # folder must be this many chars longer tha
 MAX_AUTHOR_LEN = 50                   # truncation limit for author in filenames
 DECISION_CACHE_FILE = '.ab_decisions.json'  # persists interactive choices across restarts
 MAX_TRANSCODE_WORKERS = 2             # cap parallel ffmpeg processes to limit memory on ARM
+COLLECTION_MERGE_MAX_BYTES = 100 * 1024 * 1024   # 100 MB — files larger than this are full novels, not stories
 
 _PLACEHOLDER_ARTISTS = frozenset({
     'artist', 'unknown', 'unknown author', 'unknown artist',
@@ -737,6 +738,11 @@ def find_audiobooks(input_dir: Path) -> dict:
 
     for parent, children in parent_groups.items():
         if len(children) > 1 and all(len(books[c]) == 1 for c in children):
+            # Only merge when every file is small enough to be a story/chapter,
+            # not a full-length novel (e.g. a series boxset with one file per book).
+            all_files = [f for c in children for f in books[c]]
+            if any(f.stat().st_size > COLLECTION_MERGE_MAX_BYTES for f in all_files):
+                continue
             merged_files: list = []
             for child in children:
                 merged_files.extend(books.pop(child))

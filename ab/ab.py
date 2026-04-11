@@ -725,6 +725,28 @@ def find_audiobooks(input_dir: Path) -> dict:
     if loose_count:
         print(f"[!] Ignored {loose_count} loose audio file(s) sitting directly in the root folder.")
 
+    # Consolidation: when a non-root folder has multiple child folders that
+    # each contain a single audio file, merge them into one book.  This
+    # handles short-story collections split into per-story subfolders
+    # (e.g. "Brief Cases/Story 1/story.mp3", "Brief Cases/Story 2/story.mp3").
+    parent_groups: dict[Path, list[Path]] = {}
+    for book_dir in list(books):
+        parent = book_dir.parent
+        if parent != root:
+            parent_groups.setdefault(parent, []).append(book_dir)
+
+    for parent, children in parent_groups.items():
+        if len(children) > 1 and all(len(books[c]) == 1 for c in children):
+            merged_files: list = []
+            for child in children:
+                merged_files.extend(books.pop(child))
+            if parent in books:
+                books[parent].extend(merged_files)
+            else:
+                books[parent] = merged_files
+            print(f"[*] Merged {len(children)} single-file subfolders under: {parent.name}")
+            log.info(f"Merged {len(children)} single-file subfolder(s) under: {parent.name}")
+
     return books
 
 

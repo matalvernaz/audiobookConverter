@@ -71,6 +71,8 @@ SILENCE_MIN_DURATION = 0.5            # minimum silence duration in seconds
 FOLDER_NAME_MIN_ADVANTAGE = 8        # folder must be this many chars longer than album
 
 MAX_AUTHOR_LEN = 50                   # truncation limit for author in filenames
+DECISION_CACHE_FILE = '.ab_decisions.json'  # persists interactive choices across restarts
+MAX_TRANSCODE_WORKERS = 2             # cap parallel ffmpeg processes to limit memory on ARM
 
 _PLACEHOLDER_ARTISTS = frozenset({
     'artist', 'unknown', 'unknown author', 'unknown artist',
@@ -199,6 +201,33 @@ def truncate_author(author: str, max_len: int = MAX_AUTHOR_LEN) -> str:
         return author
     primary = author.split(',')[0].split('&')[0].split(' and ')[0].strip()
     return primary + ' and Others'
+
+
+# ---------------------------------------------------------------------------
+# Decision cache — persist interactive choices across restarts
+# ---------------------------------------------------------------------------
+
+def _load_decision_cache(cache_path: Path) -> dict:
+    """Load the decision cache from disk. Returns empty dict on any error."""
+    if cache_path.exists():
+        try:
+            with open(cache_path, encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_decision(cache_path: Path, cache: dict, key: str, decision: dict) -> None:
+    """Write a single decision to the cache and flush to disk immediately."""
+    cache[key] = decision
+    try:
+        tmp = cache_path.with_suffix('.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+        tmp.replace(cache_path)
+    except OSError as e:
+        log.warning(f"Failed to save decision cache: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +768,7 @@ def probe_file(filepath: Path):
 def transcode_worker(input_path: Path, output_path: Path, bitrate: str) -> Path:
     cmd = [
         'ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
+        '-threads', '2',
         '-i', str(input_path),
         '-c:a', 'aac', '-b:a', bitrate,
         '-vn',
@@ -1034,6 +1064,8 @@ def process_book(
     no_lookup: bool = False,
     existing_stems: list | None = None,
     chapterize: bool = False,
+    decision_cache: dict | None = None,
+    cache_path: Path | None = None,
 ):
     print(f"\n{'=' * 60}")
     print(f"  Audiobook: {book_dir.name}")
@@ -1064,11 +1096,36 @@ def process_book(
             return
         print("[*] No match found. Proceeding …")
 
+    # --- Decision cache: check for a previous abort/choice ----------------
+    cache_key = str(book_dir)
+    cached_decision = (decision_cache or {}).get(cache_key)
+    if cached_decision and cached_decision.get('aborted'):
+        print("    [*] Previously aborted — skipping. (Use --clear-cache to reset)")
+        log.info(f"Skipped (cached abort): {book_dir.name}")
+        return
+
     # --- Single .m4b: already converted -----------------------------------
     if len(files) == 1 and files[0].suffix.lower() == '.m4b':
-        book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
-            early_title, early_author, auto_lookup, no_lookup,
-        )
+        if cached_decision and not cached_decision.get('aborted'):
+            print(f"    [*] Using cached decision: \"{cached_decision['title']}\" by {cached_decision['author']}")
+            book_title   = cached_decision['title']
+            book_author  = cached_decision['author']
+            cover_url    = cached_decision.get('cover_url')
+            book_desc    = cached_decision.get('desc', '')
+            book_series  = cached_decision.get('series', '')
+            book_narrator = cached_decision.get('narrator', '')
+            abort = False
+        else:
+            book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
+                early_title, early_author, auto_lookup, no_lookup,
+            )
+            if decision_cache is not None and cache_path is not None:
+                _save_decision(cache_path, decision_cache, cache_key, {
+                    'title': book_title or '', 'author': book_author or '',
+                    'cover_url': cover_url, 'desc': book_desc or '',
+                    'series': book_series or '', 'narrator': book_narrator or '',
+                    'aborted': abort, 'timestamp': datetime.now().isoformat(),
+                })
         if abort:
             print("[!] Aborted by user.")
             return
@@ -1124,9 +1181,26 @@ def process_book(
         log.warning(f"No valid audio files: {book_dir.name}")
         return
 
-    book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
-        early_title, early_author, auto_lookup, no_lookup,
-    )
+    if cached_decision and not cached_decision.get('aborted'):
+        print(f"    [*] Using cached decision: \"{cached_decision['title']}\" by {cached_decision['author']}")
+        book_title    = cached_decision['title']
+        book_author   = cached_decision['author']
+        cover_url     = cached_decision.get('cover_url')
+        book_desc     = cached_decision.get('desc', '')
+        book_series   = cached_decision.get('series', '')
+        book_narrator = cached_decision.get('narrator', '')
+        abort = False
+    else:
+        book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
+            early_title, early_author, auto_lookup, no_lookup,
+        )
+        if decision_cache is not None and cache_path is not None:
+            _save_decision(cache_path, decision_cache, cache_key, {
+                'title': book_title or '', 'author': book_author or '',
+                'cover_url': cover_url, 'desc': book_desc or '',
+                'series': book_series or '', 'narrator': book_narrator or '',
+                'aborted': abort, 'timestamp': datetime.now().isoformat(),
+            })
     if abort:
         print("[!] Aborted by user.")
         return
@@ -1174,7 +1248,7 @@ def process_book(
         if not can_copy:
             print(f"    [~] Transcoding {len(track_data)} chapter(s) to AAC {bitrate} …")
             transcode_errors = []
-            with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as xc:
+            with ThreadPoolExecutor(max_workers=min(MAX_TRANSCODE_WORKERS, os.cpu_count() or 1)) as xc:
                 future_map = {}
                 for i, t in enumerate(track_data):
                     out = tmp / f"{i:04d}.m4a"
@@ -1326,6 +1400,7 @@ def main():
     parser.add_argument('--auto-lookup',   action='store_true', help='Auto-select the top metadata result')
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')
     parser.add_argument('--chapterize',    action='store_true', help='Detect chapters via speech recognition for single-file audiobooks (requires: pip install faster-whisper)')
+    parser.add_argument('--clear-cache',  action='store_true', help='Clear cached interactive decisions and re-prompt for everything')
     parser.add_argument('--log', metavar='FILE', help='Log file path (default: ab_TIMESTAMP.log in output dir)')
     args = parser.parse_args()
 
@@ -1344,6 +1419,17 @@ def main():
     log.info(f"Output: {out_p}")
     log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}")
     print(f"[*] Logging to: {log_path}")
+
+    # Decision cache — remembers interactive choices across restarts
+    cache_path = out_p / DECISION_CACHE_FILE
+    if args.clear_cache and cache_path.exists():
+        cache_path.unlink()
+        print("[*] Decision cache cleared.")
+        log.info("Decision cache cleared by --clear-cache")
+    decision_cache = _load_decision_cache(cache_path)
+    if decision_cache:
+        print(f"[*] Loaded {len(decision_cache)} cached decision(s) from previous run.")
+        log.info(f"Loaded {len(decision_cache)} cached decision(s)")
 
     books = find_audiobooks(in_p)
 
@@ -1366,6 +1452,8 @@ def main():
             no_lookup=args.no_lookup,
             existing_stems=existing_stems,
             chapterize=args.chapterize,
+            decision_cache=decision_cache,
+            cache_path=cache_path,
         )
 
     log.info("Done")

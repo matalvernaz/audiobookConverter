@@ -1131,10 +1131,13 @@ def process_book(
     raw_album  = initial['album']  if initial else book_dir.name
     raw_artist = initial['artist'] if initial else 'Unknown Author'
 
+    # Files from multiple subdirectories means a merged collection — the album
+    # tag of any one file is a chapter/story name, not the collection title.
+    is_collection = len({f.parent for f in files}) > 1
+
     # Only prefer the folder name when the album tag is absent, a placeholder,
-    # or very short (< 15 chars) — avoids using noisy folder names over clean
-    # album tags that happen to be shorter (e.g. "Album" vs "Album - NoisySuffix").
-    use_folder   = 'unknown' in raw_album.lower() or (len(raw_album) < 15 and len(book_dir.name) > len(raw_album) + FOLDER_NAME_MIN_ADVANTAGE)
+    # very short (< 15 chars), or the book is a merged collection.
+    use_folder   = is_collection or 'unknown' in raw_album.lower() or (len(raw_album) < 15 and len(book_dir.name) > len(raw_album) + FOLDER_NAME_MIN_ADVANTAGE)
     early_title  = clean_title(book_dir.name if use_folder else raw_album)
     early_author = normalise_author(raw_artist)
     early_title  = strip_author_from_title(early_title, early_author)

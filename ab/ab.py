@@ -73,6 +73,7 @@ FOLDER_NAME_MIN_ADVANTAGE = 8        # folder must be this many chars longer tha
 MAX_AUTHOR_LEN = 50                   # truncation limit for author in filenames
 DECISION_CACHE_FILE = '.ab_decisions.json'  # persists interactive choices across restarts
 MAX_TRANSCODE_WORKERS = None          # None = use all CPU cores for parallel transcoding
+TRANSCODE_TIMEOUT = 3600              # per-file transcode timeout in seconds (60 min)
 MERGE_CACHE_PREFIX = 'merge:'                     # decision cache key prefix for folder-merge prompts
 
 _PLACEHOLDER_ARTISTS = frozenset({
@@ -820,14 +821,20 @@ def probe_file(filepath: Path):
 
 def transcode_worker(input_path: Path, output_path: Path, bitrate: str) -> Path:
     cmd = [
-        'ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
+        'ffmpeg', '-y', '-nostdin', '-loglevel', 'error',
         '-threads', '0',
         '-i', str(input_path),
         '-c:a', 'aac', '-b:a', bitrate,
         '-vn',
         str(output_path),
     ]
-    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                timeout=TRANSCODE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"ffmpeg transcode timed out after {TRANSCODE_TIMEOUT}s for {input_path.name}"
+        )
     if result.returncode != 0:
         raise RuntimeError(
             f"ffmpeg transcode failed for {input_path.name}: "
@@ -898,7 +905,7 @@ _CHAPTER_WORDS = frozenset({'chapter', 'part', 'book'}) | _STANDALONE_MARKERS
 def _find_silence_ends(audio_file: Path, noise_db: int = SILENCE_NOISE_DB, min_dur: float = SILENCE_MIN_DURATION) -> list[float]:
     """Return timestamps (seconds) where silence ends — potential chapter start points."""
     cmd = [
-        'ffmpeg', '-nostdin', '-loglevel', 'quiet',
+        'ffmpeg', '-nostdin', '-loglevel', 'info',
         '-i', str(audio_file),
         '-af', f'silencedetect=noise={noise_db}dB:d={min_dur}',
         '-f', 'null', '-',
@@ -1079,7 +1086,7 @@ def retag_m4b(
                 fm.write(f"comment={desc_escaped}\n")
                 fm.write(f"description={desc_escaped}\n")
 
-        cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'quiet',
+        cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'error',
                '-i', str(source_file), '-i', str(meta_file)]
         if cover_file and cover_file.exists():
             cmd += ['-i', str(cover_file),
@@ -1117,6 +1124,7 @@ def process_book(
     no_lookup: bool = False,
     existing_stems: list | None = None,
     chapterize: bool = False,
+    skip_transcode_errors: bool = False,
     decision_cache: dict | None = None,
     cache_path: Path | None = None,
 ):
@@ -1322,10 +1330,17 @@ def process_book(
             print()
 
             if transcode_errors:
-                print("[!] Some files failed to transcode:")
+                print(f"[!] {len(transcode_errors)}/{len(track_data)} file(s) failed to transcode:")
                 for err in transcode_errors:
                     print(f"    {err}")
                     log.error(f"Transcode: {err}")
+                if not skip_transcode_errors:
+                    log.warning(f"Aborting (transcode errors): {book_dir.name}")
+                    return
+                track_data = [t for t in track_data if t['target'].exists()]
+                if not track_data:
+                    log.error(f"All files failed to transcode: {book_dir.name}")
+                    return
         else:
             print("    [+] Source is already AAC — stream copying (no re-encode).")
             for t in track_data:
@@ -1432,6 +1447,9 @@ def process_book(
         except RuntimeError as e:
             print(f"\n[!] Assembly failed: {e}")
             log.error(f"Assembly failed: {e}")
+            if output_file.exists():
+                output_file.unlink()
+                log.info(f"Removed partial output: {output_file.name}")
             return
 
     print(f"[+] Created: {output_file.name}")
@@ -1456,6 +1474,7 @@ def main():
     parser.add_argument('--auto-lookup',   action='store_true', help='Auto-select the top metadata result')
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')
     parser.add_argument('--chapterize',    action='store_true', help='Detect chapters via speech recognition for single-file audiobooks (requires: pip install faster-whisper)')
+    parser.add_argument('--skip-transcode-errors', action='store_true', help='Continue assembly even when some files fail to transcode')
     parser.add_argument('--clear-cache',  action='store_true', help='Clear cached interactive decisions and re-prompt for everything')
     parser.add_argument('--log', metavar='FILE', help='Log file path (default: ab_TIMESTAMP.log in output dir)')
     args = parser.parse_args()
@@ -1473,7 +1492,7 @@ def main():
     setup_logging(log_path)
     log.info(f"Input:  {in_p}")
     log.info(f"Output: {out_p}")
-    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}")
+    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}  skip_transcode_errors={args.skip_transcode_errors}")
     print(f"[*] Logging to: {log_path}")
 
     # Decision cache — remembers interactive choices across restarts
@@ -1508,6 +1527,7 @@ def main():
             no_lookup=args.no_lookup,
             existing_stems=existing_stems,
             chapterize=args.chapterize,
+            skip_transcode_errors=args.skip_transcode_errors,
             decision_cache=decision_cache,
             cache_path=cache_path,
         )

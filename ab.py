@@ -85,6 +85,13 @@ RETAG_TIMEOUT = 1800                  # m4b retag (stream-copy remux) timeout (3
 ASSEMBLY_TIMEOUT_FLOOR = 1800         # minimum assembly timeout; actual = max(floor, 2 * total_sec)
 MERGE_CACHE_PREFIX = 'merge:'                     # decision cache key prefix for folder-merge prompts
 
+# Loudness-normalization targets (EBU R128 / ffmpeg loudnorm).
+# I = -18 LUFS matches Audible's audiobook mastering convention; TP/LRA leave
+# enough headroom that linear-mode normalization works for typical speech.
+LOUDNORM_I   = -18.0
+LOUDNORM_TP  = -1.5
+LOUDNORM_LRA = 11.0
+
 _PLACEHOLDER_ARTISTS = frozenset({
     'artist', 'unknown', 'unknown author', 'unknown artist',
     'various', 'various artists', 'author', 'narrator', 'n/a', 'na',
@@ -1211,32 +1218,93 @@ def probe_file(filepath: Path):
         return None
 
 
-def transcode_worker(input_path: Path, output_path: Path, bitrate: str) -> Path:
+def _measure_loudness(input_path: Path) -> dict | None:
+    """Pass-1 loudnorm scan. Returns the measurement dict for use as
+    measured_* inputs in pass 2, or None if the scan failed."""
+    cmd = [
+        'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'info',
+        '-i', str(input_path),
+        '-af',
+        f'loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:print_format=json',
+        '-f', 'null', '-',
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE,
+                                timeout=TRANSCODE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    # loudnorm prints the JSON at the very end of stderr, after the parsed_*
+    # diagnostics. Find the last '{' through matching '}'.
+    text  = result.stderr.decode(errors='replace')
+    start = text.rfind('{')
+    end   = text.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def transcode_worker(input_path: Path, output_path: Path, bitrate: str,
+                     normalize: bool = False) -> Path:
     """Transcode to a .partial file and atomically rename on success.
 
     Why: a timed-out or failed ffmpeg can leave a truncated output, which would
     otherwise be picked up by an `exists()` check downstream and concatenated
     into a corrupt audiobook.
+
+    When normalize=True a pass-1 loudnorm scan runs first; pass 2 applies a
+    linear-mode loudnorm filter using those measurements so the per-file gain
+    is constant (dynamics preserved). If the scan fails we skip normalization
+    rather than fall through to dynamic mode.
     """
     partial = output_path.with_suffix(output_path.suffix + '.partial')
     partial.unlink(missing_ok=True)
     output_path.unlink(missing_ok=True)
 
+    filter_args: list[str] = []
+    if normalize:
+        m = _measure_loudness(input_path)
+        if m is not None:
+            filter_args = [
+                '-af',
+                (
+                    f'loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}'
+                    f":measured_I={m.get('input_i')}"
+                    f":measured_TP={m.get('input_tp')}"
+                    f":measured_LRA={m.get('input_lra')}"
+                    f":measured_thresh={m.get('input_thresh')}"
+                    f":offset={m.get('target_offset')}"
+                    ':linear=true:print_format=summary'
+                ),
+            ]
+
+    # -f ipod forces the MP4 muxer ffmpeg uses for .m4a/.m4b output. Without
+    # this, the `.partial` extension on the temp file confuses muxer detection
+    # and ffmpeg refuses to open the output.
     cmd = [
         'ffmpeg', '-y', '-nostdin', '-loglevel', 'error',
         '-threads', '0',
         '-i', str(input_path),
+        *filter_args,
         '-c:a', 'aac', '-b:a', bitrate,
         '-vn',
+        '-f', 'ipod',
         str(partial),
     ]
+    # Pass 1 doubles wall time; give pass 2 the same allowance either way.
+    timeout = TRANSCODE_TIMEOUT
     try:
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                timeout=TRANSCODE_TIMEOUT)
+                                timeout=timeout)
     except subprocess.TimeoutExpired:
         partial.unlink(missing_ok=True)
         raise RuntimeError(
-            f"ffmpeg transcode timed out after {TRANSCODE_TIMEOUT}s for {input_path.name}"
+            f"ffmpeg transcode timed out after {timeout}s for {input_path.name}"
         )
     if result.returncode != 0:
         partial.unlink(missing_ok=True)
@@ -1578,6 +1646,7 @@ def process_book(
     chapterize: bool = False,
     accept_chapters: bool = False,
     skip_transcode_errors: bool = False,
+    normalize: bool = False,
     decision_cache: dict | None = None,
     cache_path: Path | None = None,
 ):
@@ -1743,10 +1812,18 @@ def process_book(
         codecs       = {t['codec'] for t in track_data}
         sample_rates = {t['sample_rate'] for t in track_data}
         channels     = {t['channels'] for t in track_data}
-        can_copy     = (codecs == {'aac'} and len(sample_rates) == 1 and len(channels) == 1)
+        # Stream-copy fast path is unavailable when normalizing — loudnorm
+        # has to run during a re-encode.
+        can_copy     = (
+            not normalize
+            and codecs == {'aac'}
+            and len(sample_rates) == 1
+            and len(channels) == 1
+        )
 
         if not can_copy:
-            print(f"    [~] Transcoding {len(track_data)} chapter(s) to AAC {bitrate} …")
+            label = f"AAC {bitrate}" + (' + loudnorm' if normalize else '')
+            print(f"    [~] Transcoding {len(track_data)} chapter(s) to {label} …")
             transcode_errors = []
             successful_indexes: set[int] = set()
             with ThreadPoolExecutor(max_workers=MAX_TRANSCODE_WORKERS or (os.cpu_count() or 1)) as xc:
@@ -1754,7 +1831,7 @@ def process_book(
                 for i, t in enumerate(track_data):
                     out = tmp / f"{i:04d}.m4a"
                     t['target'] = out
-                    future_map[xc.submit(transcode_worker, t['path'], out, bitrate)] = i
+                    future_map[xc.submit(transcode_worker, t['path'], out, bitrate, normalize)] = i
 
                 done = 0
                 for future in as_completed(future_map):
@@ -1941,6 +2018,7 @@ def main():
     parser.add_argument('--accept-chapters', action='store_true', help='When --chapterize is used, accept the detected chapters without prompting (for non-interactive / GUI use)')
     parser.add_argument('--non-interactive', action='store_true', help='Fail fast instead of prompting. Use when launching from a GUI / cron / pipe — any cache-miss that would otherwise need a prompt aborts the book cleanly.')
     parser.add_argument('--skip-transcode-errors', action='store_true', help='Continue assembly even when some files fail to transcode')
+    parser.add_argument('--normalize', action='store_true', help=f'Loudness-normalize each file to {LOUDNORM_I:g} LUFS (EBU R128, two-pass, linear). Skip for full-cast productions where dynamic range is intentional.')
     parser.add_argument('--clear-cache',  action='store_true', help='Clear cached interactive decisions and re-prompt for everything')
     parser.add_argument('--re-prompt', metavar='PATH', nargs='+', default=[],
                         help='Drop cached decisions for these specific folder paths so the script will re-prompt for them; leaves the rest of the cache intact. May be passed multiple paths.')
@@ -1964,7 +2042,7 @@ def main():
     _log_tool_versions()
     log.info(f"Input:  {in_p}")
     log.info(f"Output: {out_p}")
-    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}  accept_chapters={args.accept_chapters}  non_interactive={args.non_interactive}  skip_transcode_errors={args.skip_transcode_errors}")
+    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}  accept_chapters={args.accept_chapters}  non_interactive={args.non_interactive}  skip_transcode_errors={args.skip_transcode_errors}  normalize={args.normalize}")
     print(f"[*] Logging to: {log_path}")
 
     # Decision cache — remembers interactive choices across restarts
@@ -2022,6 +2100,7 @@ def main():
             chapterize=args.chapterize,
             accept_chapters=args.accept_chapters,
             skip_transcode_errors=args.skip_transcode_errors,
+            normalize=args.normalize,
             decision_cache=decision_cache,
             cache_path=cache_path,
         )

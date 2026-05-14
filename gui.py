@@ -594,7 +594,16 @@ class MainFrame(wx.Frame):
         options.Add(self.auto_lookup_ctrl, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 16)
 
         self.skip_transcode_ctrl = wx.CheckBox(panel, label='Continue past transcode errors')
-        options.Add(self.skip_transcode_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
+        options.Add(self.skip_transcode_ctrl, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 16)
+
+        self.normalize_ctrl = wx.CheckBox(panel, label='Normalize loudness (skip for full-cast)')
+        self.normalize_ctrl.SetToolTip(
+            'Loudness-normalize each file to about -18 LUFS using a two-pass linear '
+            'loudnorm filter. Recommended for mixed-source books. Leave OFF for '
+            'full-cast productions (e.g. Graphic Audio) where dynamic range is '
+            'intentional.'
+        )
+        options.Add(self.normalize_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
 
         outer.Add(options, 0, wx.ALL | wx.EXPAND, 10)
 
@@ -678,6 +687,7 @@ class MainFrame(wx.Frame):
             self.bitrate_ctrl.SetValue(prefs.get('bitrate', DEFAULT_BITRATE))
             self.auto_lookup_ctrl.SetValue(prefs.get('auto_lookup', False))
             self.skip_transcode_ctrl.SetValue(prefs.get('skip_transcode_errors', False))
+            self.normalize_ctrl.SetValue(prefs.get('normalize', False))
         except Exception:
             pass
 
@@ -692,6 +702,7 @@ class MainFrame(wx.Frame):
                     'bitrate':               self.bitrate_ctrl.GetValue(),
                     'auto_lookup':           self.auto_lookup_ctrl.GetValue(),
                     'skip_transcode_errors': self.skip_transcode_ctrl.GetValue(),
+                    'normalize':             self.normalize_ctrl.GetValue(),
                 }, f, indent=2)
         except Exception:
             pass  # prefs are not load-bearing
@@ -998,6 +1009,8 @@ class MainFrame(wx.Frame):
             cmd.append('--auto-lookup')
         if self.skip_transcode_ctrl.GetValue():
             cmd.append('--skip-transcode-errors')
+        if self.normalize_ctrl.GetValue():
+            cmd.append('--normalize')
 
         self._save_prefs()
 

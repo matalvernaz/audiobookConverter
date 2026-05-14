@@ -463,9 +463,31 @@ def _ffmeta_escape(value: str) -> str:
     )
 
 
+_WIN_RESERVED_BASENAMES = (
+    {'CON', 'PRN', 'AUX', 'NUL'}
+    | {f'COM{i}' for i in range(1, 10)}
+    | {f'LPT{i}' for i in range(1, 10)}
+)
+_FILENAME_FORBIDDEN_RE = re.compile(r'[\\/*?:"<>|\x00-\x1f]')
+
+
+def _sanitize_filename_part(s: str) -> str:
+    """Make `s` safe to use as part of a cross-platform filename.
+
+    Strips characters Windows rejects (the explicit set plus ASCII controls),
+    trims trailing dots and whitespace (Windows silently drops them, which
+    causes "Author - Vol. " → "Author - Vol" collisions), and prefixes
+    Windows reserved basenames (CON, PRN, COM1…) with an underscore — those
+    names are rejected on Windows even when given a suffix.
+    """
+    cleaned = _FILENAME_FORBIDDEN_RE.sub('', s).rstrip(' .')
+    if cleaned.upper() in _WIN_RESERVED_BASENAMES:
+        cleaned = '_' + cleaned
+    return cleaned
+
+
 def safe_filename(author: str, title: str) -> str:
-    forbidden = r'[\\/*?:"<>|]'
-    return f"{re.sub(forbidden, '', author)} - {re.sub(forbidden, '', title)}.m4b"
+    return f"{_sanitize_filename_part(author)} - {_sanitize_filename_part(title)}.m4b"
 
 
 def truncate_author(author: str, max_len: int = MAX_AUTHOR_LEN) -> str:
@@ -480,14 +502,29 @@ def truncate_author(author: str, max_len: int = MAX_AUTHOR_LEN) -> str:
 # ---------------------------------------------------------------------------
 
 def _load_decision_cache(cache_path: Path) -> dict:
-    """Load the decision cache from disk. Returns empty dict on any error."""
-    if cache_path.exists():
+    """Load the decision cache from disk. Returns empty dict on any error.
+
+    On JSON corruption we move the bad file aside as `<name>.corrupt` before
+    returning empty — otherwise the next _save_decision call would atomically
+    replace the corrupt cache with a fresh empty one, taking every cached
+    decision down with it.
+    """
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        backup = cache_path.with_suffix(cache_path.suffix + '.corrupt')
         try:
-            with open(cache_path, encoding='utf-8') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+            cache_path.replace(backup)
+            log.warning(f"Decision cache was corrupt; moved to {backup.name} ({e})")
+        except OSError as move_err:
+            log.warning(f"Decision cache corrupt and couldn't be backed up: {e} (move: {move_err})")
+        return {}
+    except OSError as e:
+        log.warning(f"Decision cache unreadable: {e}")
+        return {}
 
 
 def _save_decision(cache_path: Path, cache: dict, key: str, decision: dict) -> None:
@@ -1946,12 +1983,21 @@ def process_book(
                 curr_ms += dur_ms
 
         # --- Write concat list and FFMETADATA file -------------------------
+        # Paths inside the staging tmpdir are numbered (input_NNNN.ext) so
+        # they never contain spaces or special chars themselves, but the
+        # tmpdir prefix can — e.g. a Windows username containing an
+        # apostrophe makes %TEMP% include one too. ffmpeg's concat demuxer
+        # tokenizer treats a bare `'` as end-of-quoted-string, so escape
+        # the only character that can break parsing.
+        def _concat_quote(p: Path) -> str:
+            return str(p).replace("'", "'\\''")
+
         with open(concat_list, 'w', encoding='utf-8') as fc:
             if speech_chapters:
-                fc.write(f"file '{track_data[0]['concat_target']}'\n")
+                fc.write(f"file '{_concat_quote(track_data[0]['concat_target'])}'\n")
             else:
                 for t in track_data:
-                    fc.write(f"file '{t['concat_target']}'\n")
+                    fc.write(f"file '{_concat_quote(t['concat_target'])}'\n")
 
         with open(meta_file, 'w', encoding='utf-8') as fm:
             fm.write(render_book_ffmetadata(meta, chapter_specs))

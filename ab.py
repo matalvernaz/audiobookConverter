@@ -104,6 +104,17 @@ STRUCTURAL_FOLDER_RE = re.compile(
 # Logging
 # ---------------------------------------------------------------------------
 
+def _ensure_bundled_tools_on_path() -> None:
+    """When packaged with PyInstaller, ffmpeg.exe/ffprobe.exe ship next to the
+    exe. Prepend that dir to PATH so subprocess('ffmpeg', ...) finds them."""
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        os.environ['PATH'] = exe_dir + os.pathsep + os.environ.get('PATH', '')
+
+
+_ensure_bundled_tools_on_path()
+
+
 log = logging.getLogger('ab')
 
 
@@ -742,7 +753,19 @@ def interactive_lookup(
 # Audiobook discovery
 # ---------------------------------------------------------------------------
 
-def find_audiobooks(input_dir: Path, decision_cache: dict | None = None, cache_path: Path | None = None) -> dict:
+def find_audiobooks(
+    input_dir: Path,
+    decision_cache: dict | None = None,
+    cache_path: Path | None = None,
+    prompt_merge=None,
+) -> dict:
+    """Discover audiobook folders under input_dir.
+
+    prompt_merge: optional callable (parent_name: str, children: list[str]) -> bool.
+    Used to intercept the "merge subfolders?" prompt when running from the GUI;
+    if None, falls back to a stdin y/N prompt. Cached decisions are honoured
+    in both modes.
+    """
     root       = input_dir.resolve()
     all_files  = [p for p in root.rglob('*') if p.suffix.lower() in AUDIO_EXTS]
     books: dict = {}
@@ -793,14 +816,17 @@ def find_audiobooks(input_dir: Path, decision_cache: dict | None = None, cache_p
             if len(subfolder_names) > 6:
                 print(f"    … and {len(subfolder_names) - 6} more")
             print(f"{'=' * 60}")
-            _flush_stdin()
-            try:
-                raw = input("  Merge into one book? [y/N]: ").strip().lower()
-            except EOFError:
-                log.error("Stdin closed (EOF) during merge prompt. Exiting.")
-                print("\n[!] Stdin closed — exiting (cannot prompt interactively).")
-                sys.exit(1)
-            merge = raw in ('y', 'yes')
+            if prompt_merge is not None:
+                merge = bool(prompt_merge(parent.name, subfolder_names))
+            else:
+                _flush_stdin()
+                try:
+                    raw = input("  Merge into one book? [y/N]: ").strip().lower()
+                except EOFError:
+                    log.error("Stdin closed (EOF) during merge prompt. Exiting.")
+                    print("\n[!] Stdin closed — exiting (cannot prompt interactively).")
+                    sys.exit(1)
+                merge = raw in ('y', 'yes')
             if decision_cache is not None and cache_path is not None:
                 _save_decision(cache_path, decision_cache, cache_key, {
                     'merge': merge, 'timestamp': datetime.now().isoformat(),
@@ -1238,6 +1264,7 @@ def process_book(
     no_lookup: bool = False,
     existing_stems: list | None = None,
     chapterize: bool = False,
+    accept_chapters: bool = False,
     skip_transcode_errors: bool = False,
     decision_cache: dict | None = None,
     cache_path: Path | None = None,
@@ -1513,18 +1540,23 @@ def process_book(
                     h, m = divmod(m, 60)
                     print(f"        {h:02d}:{m:02d}:{s:02d}  {ch_title}")
                     log.info(f"Chapterize:   {h:02d}:{m:02d}:{s:02d}  {ch_title}")
-                _flush_stdin()
-                try:
-                    raw = input("    Use these chapters? [Y/n]: ").strip().lower()
-                except EOFError:
-                    log.error("Stdin closed (EOF) during chapter prompt. Exiting.")
-                    print("\n[!] Stdin closed — exiting (cannot prompt interactively).")
-                    sys.exit(1)
-                if raw in ('', 'y', 'yes'):
+                if accept_chapters:
                     speech_chapters = detected
-                    log.info("Chapterize: chapters accepted by user")
+                    print("    [+] Auto-accepting detected chapters (--accept-chapters).")
+                    log.info("Chapterize: chapters auto-accepted via --accept-chapters")
                 else:
-                    log.info("Chapterize: chapters rejected by user")
+                    _flush_stdin()
+                    try:
+                        raw = input("    Use these chapters? [Y/n]: ").strip().lower()
+                    except EOFError:
+                        log.error("Stdin closed (EOF) during chapter prompt. Exiting.")
+                        print("\n[!] Stdin closed — exiting (cannot prompt interactively).")
+                        sys.exit(1)
+                    if raw in ('', 'y', 'yes'):
+                        speech_chapters = detected
+                        log.info("Chapterize: chapters accepted by user")
+                    else:
+                        log.info("Chapterize: chapters rejected by user")
             else:
                 print("    [!] No chapter markers detected via speech recognition.")
                 log.info("Chapterize: no chapter markers detected")
@@ -1630,6 +1662,7 @@ def main():
     parser.add_argument('--auto-lookup',   action='store_true', help='Auto-select the top metadata result')
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')
     parser.add_argument('--chapterize',    action='store_true', help='Detect chapters via speech recognition for single-file audiobooks (requires: pip install faster-whisper)')
+    parser.add_argument('--accept-chapters', action='store_true', help='When --chapterize is used, accept the detected chapters without prompting (for non-interactive / GUI use)')
     parser.add_argument('--skip-transcode-errors', action='store_true', help='Continue assembly even when some files fail to transcode')
     parser.add_argument('--clear-cache',  action='store_true', help='Clear cached interactive decisions and re-prompt for everything')
     parser.add_argument('--re-prompt', metavar='PATH', nargs='+', default=[],
@@ -1650,7 +1683,7 @@ def main():
     setup_logging(log_path)
     log.info(f"Input:  {in_p}")
     log.info(f"Output: {out_p}")
-    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}  skip_transcode_errors={args.skip_transcode_errors}")
+    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}  accept_chapters={args.accept_chapters}  skip_transcode_errors={args.skip_transcode_errors}")
     print(f"[*] Logging to: {log_path}")
 
     # Decision cache — remembers interactive choices across restarts
@@ -1706,6 +1739,7 @@ def main():
             no_lookup=args.no_lookup,
             existing_stems=existing_stems,
             chapterize=args.chapterize,
+            accept_chapters=args.accept_chapters,
             skip_transcode_errors=args.skip_transcode_errors,
             decision_cache=decision_cache,
             cache_path=cache_path,

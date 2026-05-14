@@ -1,6 +1,11 @@
-# audiobookConverter (ab.py)
+# audiobookConverter
 
-Converts directories of audio files into single, chaptered `.m4b` audiobooks. Pulls cover art, descriptions, series, and narrator from iTunes / Google Books / Open Library / Audnexus. Interactive by default — you review and pick the metadata match for each book.
+Converts directories of audio files into single, chaptered `.m4b` audiobooks. Pulls cover art, descriptions, series, and narrator from iTunes / Google Books / Open Library / Audnexus.
+
+Ships as two front-ends sharing one engine:
+
+- **`ab.py`** — the CLI. Interactive numbered picker per book; the original tool.
+- **`Audiobook Converter`** — wxPython desktop GUI for Windows users who'd rather click than type. Wraps the CLI; same metadata sources, same output.
 
 ## Highlights
 
@@ -112,11 +117,52 @@ Interactive choices are saved to `<output_dir>/.ab_decisions.json`. Re-running `
 
 Aborted books are *not* cached, so just running the script again is enough to retry an aborted folder.
 
+## GUI (Windows)
+
+`Audiobook Converter` is a desktop front-end for non-CLI users. It wraps `ab.py` — same conversion logic — but presents the metadata picker, merge prompt, and progress as accessible wxPython dialogs (NVDA-friendly).
+
+**Workflow:** pick an input and output folder, click **Scan**, look up metadata for each detected book in a dialog (or click **Look up all pending books** to step through them one after another), then **Convert all** runs `ab.py` in the background and streams its log into a window.
+
+**Install (end-user, Windows):** download `AudiobookConverter-<version>-Windows.zip` from the [Releases page](https://github.com/matalvernaz/audiobookConverter/releases), unzip anywhere, run `Audiobook Converter.exe`. The release bundle includes ffmpeg/ffprobe — no separate install needed.
+
+**Run from source (development):**
+
+```
+pip install wxPython
+python gui.py
+```
+
+**Build the Windows release locally (rare):**
+
+```
+# On Windows, with ffmpeg.exe + ffprobe.exe in vendor/ffmpeg/
+pip install wxPython pyinstaller
+pyinstaller audiobookConverter.spec
+# Output in dist/AudiobookConverter/
+```
+
+Releases are built automatically by `.github/workflows/release-windows.yml` when a `v*` tag is pushed.
+
+### GUI feature parity
+
+| CLI flag | GUI |
+|----------|-----|
+| `--auto-lookup` | "Auto-pick top match for unset books" checkbox |
+| `--no-lookup` | Implicit when every book is skipped via "Skip" |
+| `--dry-run` | Not exposed (run a small test folder instead) |
+| `--chapterize` | **Not in V1** — coming as a runtime-install button |
+| `--skip-transcode-errors` | "Continue past transcode errors" checkbox |
+| `--clear-cache` | "Re-prompt selected" per book; full clear via deleting `.ab_decisions.json` |
+| `--re-prompt` | "Re-prompt selected" button |
+
 ## Project layout
 
 ```
-README.md      — this file
-ab.py          — the converter (single file, no package)
+README.md                        — this file
+ab.py                            — the CLI / conversion engine
+gui.py                           — the wxPython desktop GUI
+audiobookConverter.spec          — PyInstaller spec (builds ab.exe + Audiobook Converter.exe)
+.github/workflows/release-windows.yml — CI: build & publish Windows release on v* tag
 ```
 
 ## License

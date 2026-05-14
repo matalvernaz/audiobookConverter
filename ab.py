@@ -24,8 +24,11 @@ import argparse
 import tempfile
 import urllib.request
 import urllib.parse
-import termios
 import threading
+try:
+    import termios  # POSIX only — used to flush stdin before interactive prompts
+except ImportError:
+    termios = None
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -936,6 +939,8 @@ def search_metadata(title: str, author: str) -> list:
 # ---------------------------------------------------------------------------
 
 def _flush_stdin():
+    if termios is None:
+        return
     try:
         termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except Exception:

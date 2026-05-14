@@ -316,14 +316,22 @@ class MetadataDialog(wx.Dialog):
         idx = evt.GetIndex()
         if 0 <= idx < len(self.results):
             r = self.results[idx]
+            series_disp = r.get('series', '') or '—'
+            if r.get('series_part'):
+                series_disp = f"{r['series']} #{r['series_part']}"
             lines = [
-                f"Title:    {r.get('title', '')}",
-                f"Author:   {r.get('author', '')}",
-                f"Year:     {r.get('year', '')}",
-                f"Source:   {r.get('source', '')}",
-                f"Series:   {r.get('series', '') or '—'}",
-                f"Narrator: {r.get('narrator', '') or '—'}",
-                f"Cover:    {'yes' if r.get('cover_url') else 'no'}",
+                f"Title:     {r.get('title', '')}",
+                f"Author:    {r.get('author', '')}",
+                f"Narrator:  {r.get('narrator', '') or '—'}",
+                f"Series:    {series_disp}",
+                f"Year:      {r.get('year', '')}",
+                f"Publisher: {r.get('publisher', '') or '—'}",
+                f"Language:  {r.get('language', '') or '—'}",
+                f"Genre:     {r.get('genre', '') or '—'}",
+                f"ASIN:      {r.get('asin', '') or '—'}",
+                f"ISBN:      {r.get('isbn', '') or '—'}",
+                f"Source:    {r.get('source', '')}",
+                f"Cover:     {'yes' if r.get('cover_url') else 'no'}",
                 '',
                 'Description:',
                 r.get('desc', '') or '(no description)',
@@ -338,30 +346,28 @@ class MetadataDialog(wx.Dialog):
             return
         r = self.results[idx]
         norm_author = ab.normalise_author(self.author_ctrl.GetValue().strip())
-        self.choice = {
-            'title':     r.get('title', '')  or self.title_ctrl.GetValue().strip(),
-            'author':    r.get('author', '') or norm_author,
-            'cover_url': r.get('cover_url') or None,
-            'desc':      r.get('desc', '')   or '',
-            'series':    r.get('series', '') or '',
-            'narrator':  r.get('narrator','') or '',
-            'source':    r.get('source', ''),
-        }
+        # Build a BookMetadata via ab.py's helper so the GUI captures every
+        # field the providers returned (publisher, date, language, asin,
+        # isbn, genre, series_part, etc.) — these all flow into the cache.
+        m = ab._result_to_meta(
+            r,
+            fallback_title=self.title_ctrl.GetValue().strip(),
+            fallback_author=norm_author,
+        )
+        self.choice = m.to_decision()
+        self.choice['source'] = r.get('source', '')
         self.EndModal(wx.ID_OK)
 
     def on_skip(self, _evt):
         # Skip = use local info. Stored as a decision with the early title/author
         # and no online enrichment, so ab.py won't re-prompt.
         norm_author = ab.normalise_author(self.author_ctrl.GetValue().strip())
-        self.choice = {
-            'title':     self.title_ctrl.GetValue().strip() or self._query_title,
-            'author':    norm_author,
-            'cover_url': None,
-            'desc':      '',
-            'series':    '',
-            'narrator':  '',
-            'source':    'local',
-        }
+        m = ab.BookMetadata(
+            title  = self.title_ctrl.GetValue().strip() or self._query_title,
+            author = norm_author,
+        )
+        self.choice = m.to_decision()
+        self.choice['source'] = 'local'
         self.EndModal(wx.ID_OK)
 
 
@@ -947,15 +953,12 @@ class MainFrame(wx.Frame):
     def _persist_decision(self, e: BookEntry):
         key = str(e.book_dir)
         d = e.decision or {}
-        self.decision_cache[key] = {
-            'title':     d.get('title', '')     or '',
-            'author':    d.get('author', '')    or '',
-            'cover_url': d.get('cover_url')     or None,
-            'desc':      d.get('desc', '')      or '',
-            'series':    d.get('series', '')    or '',
-            'narrator':  d.get('narrator', '')  or '',
-            'timestamp': datetime.now().isoformat(),
-        }
+        # Round-trip through BookMetadata so the cache always has the full,
+        # current schema regardless of which dialog (or which provider)
+        # produced the decision.
+        entry = ab.BookMetadata.from_decision(d).to_decision()
+        entry['timestamp'] = datetime.now().isoformat()
+        self.decision_cache[key] = entry
         self._save_cache()
 
     # ----------------------------------------------------------------------

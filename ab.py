@@ -26,6 +26,7 @@ import urllib.request
 import urllib.parse
 import termios
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -228,6 +229,210 @@ def clean_title(title: str) -> str:
     title = re.sub(r'^\s*[A-Z]{1,5}-\d+\s*[-–]\s*', '', title)  # series codes exposed after number strip
     title = re.sub(r'\s*\[[A-Z]{1,4}\]', '', title)            # short bracket tags: [L], [FQ], [MP3]
     return title.strip(' -_.')
+
+
+# ---------------------------------------------------------------------------
+# Book metadata model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BookMetadata:
+    """Everything we know about a book, flowing from provider → cache → tags.
+
+    All fields are strings (empty when unknown) so JSON serialization in the
+    decision cache is symmetric. cover_path is local-only and never cached.
+    """
+    title: str = ''
+    author: str = ''
+    narrator: str = ''
+    series: str = ''
+    series_part: str = ''     # numeric position within series (may be decimal)
+    description: str = ''
+    publisher: str = ''
+    date: str = ''            # year or ISO date string
+    language: str = ''
+    genre: str = 'Audiobook'
+    asin: str = ''
+    isbn: str = ''
+    copyright_: str = ''      # avoid shadowing builtin
+    cover_url: str = ''
+    cover_path: Path | None = None
+
+    @classmethod
+    def from_decision(cls, d: dict | None) -> 'BookMetadata':
+        """Construct from a decision-cache entry, tolerating the older schema
+        (title/author/cover_url/desc/series/narrator only)."""
+        if not d:
+            return cls()
+        return cls(
+            title       = d.get('title', '')       or '',
+            author      = d.get('author', '')      or '',
+            narrator    = d.get('narrator', '')    or '',
+            series      = d.get('series', '')      or '',
+            series_part = d.get('series_part', '') or '',
+            description = d.get('desc', '')        or d.get('description', '') or '',
+            publisher   = d.get('publisher', '')   or '',
+            date        = d.get('date', '')        or d.get('year', '') or '',
+            language    = d.get('language', '')    or '',
+            genre       = d.get('genre', '')       or 'Audiobook',
+            asin        = d.get('asin', '')        or '',
+            isbn        = d.get('isbn', '')        or '',
+            copyright_  = d.get('copyright', '')   or '',
+            cover_url   = d.get('cover_url')       or '',
+        )
+
+    def to_decision(self) -> dict:
+        """Serialize to a decision-cache entry (JSON-safe)."""
+        return {
+            'title':       self.title,
+            'author':      self.author,
+            'narrator':    self.narrator,
+            'series':      self.series,
+            'series_part': self.series_part,
+            'desc':        self.description,
+            'publisher':   self.publisher,
+            'date':        self.date,
+            'language':    self.language,
+            'genre':       self.genre,
+            'asin':        self.asin,
+            'isbn':        self.isbn,
+            'copyright':   self.copyright_,
+            'cover_url':   self.cover_url or None,
+        }
+
+
+_SORT_LEADING_ARTICLES = ('the ', 'a ', 'an ')
+
+
+def _sort_form(s: str) -> str:
+    """Rotate leading articles for sort-tag values.
+
+    'The Hobbit' -> 'Hobbit, The';  'A Game of Thrones' -> 'Game of Thrones, A'.
+    Apple Books and iTunes use these to alphabetise; ABS/BookPlayer ignore but
+    it's free to write.
+    """
+    if not s:
+        return s
+    low = s.lower()
+    for art in _SORT_LEADING_ARTICLES:
+        if low.startswith(art):
+            return f"{s[len(art):]}, {s[:len(art)-1]}"
+    return s
+
+
+def render_book_ffmetadata(m: BookMetadata,
+                           chapter_specs: list[tuple[int, int, str]] | None = None) -> str:
+    """Render the full body of an FFMETADATA1 file for a given book.
+
+    Emits every field that any of our target media servers / players reads:
+
+      title, artist, album (= title), album_artist, composer (= narrator),
+      genre, date, publisher, language, copyright, grouping/show/episode_id
+      (series), comment/description/synopsis, sort_*, isbn, asin,
+      media_type (stik=2), gapless_playback (pgap=1), encoder,
+      plus [CHAPTER] blocks.
+    """
+    lines: list[str] = [';FFMETADATA1']
+
+    def w(key: str, val) -> None:
+        if val is None:
+            return
+        s = str(val).strip()
+        if s:
+            lines.append(f'{key}={_ffmeta_escape(s)}')
+
+    # --- Core identification -----------------------------------------------
+    w('title',        m.title)
+    w('artist',       m.author)
+    w('album',        m.title)              # ABS prefers album for title
+    w('album_artist', m.author)             # Apple/ABS fallback/Plex match
+    w('composer',     m.narrator)           # ABS reads composer as narrator
+    w('genre',        m.genre or 'Audiobook')
+    w('date',         m.date)
+    w('publisher',    m.publisher)
+    w('language',     m.language)
+    w('copyright',    m.copyright_)
+
+    # --- Series — write THREE forms so every consumer finds something:
+    #     grouping    : ABS legacy fallback, Smart AudioBook Player
+    #     show        : modern tvsh atom (ABS modern, generic mp4 readers)
+    #     episode_id  : tves, numeric position
+    if m.series:
+        grouping_value = f"{m.series} #{m.series_part}" if m.series_part else m.series
+        w('grouping',   grouping_value)
+        w('show',       m.series)
+        if m.series_part:
+            w('episode_id', m.series_part)
+
+    # --- Description: write comment + description + synopsis to satisfy
+    #     ABS (description), pre-2024 ABS (comment), Apple ldes (synopsis).
+    if m.description:
+        w('comment',     m.description)
+        w('description', m.description)
+        w('synopsis',    m.description)
+
+    # --- Sort tags (Apple Books library ordering) --------------------------
+    if m.title:
+        w('sort_name',  _sort_form(m.title))
+        w('sort_album', _sort_form(m.title))
+    if m.author:
+        w('sort_artist',       _sort_form(m.author))
+        w('sort_album_artist', _sort_form(m.author))
+
+    # --- Identifiers (used by ABS rescans and Plex/Audnexus matching) ------
+    w('isbn', m.isbn)
+    w('asin', m.asin)
+
+    # --- Apple audiobook flags ---------------------------------------------
+    # Without media_type=2 (stik=Audiobook), Apple Books and AVFoundation
+    # treat the file as a music album — wrong icon, wrong library section,
+    # no chapter UI. gapless_playback=1 prevents micro-stutters between
+    # back-to-back chapter playback on iOS.
+    w('media_type',       '2')
+    w('gapless_playback', '1')
+    w('encoder',          'audiobookConverter')
+
+    lines.append('')
+
+    # --- Chapters ----------------------------------------------------------
+    if chapter_specs:
+        for start_ms, end_ms, title in chapter_specs:
+            lines.append('[CHAPTER]')
+            lines.append('TIMEBASE=1/1000')
+            lines.append(f'START={start_ms}')
+            lines.append(f'END={end_ms}')
+            lines.append(f'title={_ffmeta_escape(title)}')
+            lines.append('')
+
+    return '\n'.join(lines)
+
+
+# Cover normalization: scale longest side ≤2000, force JPEG, sRGB.
+# Apple Books / AVFoundation choke on PNG or oversized covers; this filter
+# fixes both in the same pass via ffmpeg (no Pillow dep needed).
+COVER_NORMALIZE_FILTER = (
+    "scale='if(gt(iw,ih),min(2000,iw),-2)':'if(gt(iw,ih),-2,min(2000,ih))'"
+)
+
+
+def cover_input_args(cover_file: Path, audio_input_index: int = 0,
+                     cover_input_index: int = 2) -> list[str]:
+    """ffmpeg args for attaching `cover_file` as a normalized JPEG cover.
+
+    Assumes the caller has already added the audio input (typically the
+    concat list at index 0) and the metadata file at index 1, so the cover
+    is input #2 by default.
+    """
+    return [
+        '-i', str(cover_file),
+        '-map', f'{audio_input_index}:a',
+        '-map', f'{cover_input_index}:0',
+        '-c:v', 'mjpeg',
+        '-pix_fmt', 'yuvj420p',
+        '-vf', COVER_NORMALIZE_FILTER,
+        '-q:v', '4',
+        '-disposition:v:0', 'attached_pic',
+    ]
 
 
 def _ffmeta_escape(value: str) -> str:
@@ -481,11 +686,19 @@ def _search_itunes(query: str) -> list:
                 'title':     clean_title(item.get('collectionName', 'Unknown')),
                 'author':    item.get('artistName', 'Unknown'),
                 'year':      item.get('releaseDate', '')[:4],
-                'cover_url': item.get('artworkUrl100', '').replace('100x100', '600x600'),
+                'date':      item.get('releaseDate', '')[:10],
+                'cover_url': item.get('artworkUrl100', '').replace('100x100', '1400x1400'),
                 'desc':      strip_html(item.get('description', '')),
                 'source':    'iTunes',
                 'series':    '',
+                'series_part': '',
                 'narrator':  '',
+                'publisher': '',
+                'language':  item.get('country', '').lower(),  # rough proxy (e.g. 'us')
+                'genre':     item.get('primaryGenreName', '') or 'Audiobook',
+                'asin':      '',
+                'isbn':      '',
+                'copyright': '',
             }
             for item in data.get('results', [])
         ]
@@ -501,15 +714,36 @@ def _search_google_books(query: str) -> list:
         results = []
         for item in data.get('items', []):
             vol = item.get('volumeInfo', {})
+            # Pull ISBN (prefer ISBN_13, fall back to ISBN_10) from
+            # industryIdentifiers if present.
+            isbn = ''
+            for ident in vol.get('industryIdentifiers', []):
+                if ident.get('type') == 'ISBN_13':
+                    isbn = ident.get('identifier', '')
+                    break
+            if not isbn:
+                for ident in vol.get('industryIdentifiers', []):
+                    if ident.get('type') == 'ISBN_10':
+                        isbn = ident.get('identifier', '')
+                        break
+            categories = vol.get('categories') or []
             results.append({
                 'title':     clean_title(vol.get('title', 'Unknown')),
                 'author':    (vol.get('authors') or ['Unknown'])[0],
                 'year':      vol.get('publishedDate', '')[:4],
+                'date':      vol.get('publishedDate', '')[:10],
                 'cover_url': vol.get('imageLinks', {}).get('thumbnail', '').replace('zoom=1', 'zoom=3'),
                 'desc':      strip_html(vol.get('description', '')),
                 'source':    'Google Books',
                 'series':    '',
+                'series_part': '',
                 'narrator':  '',
+                'publisher': vol.get('publisher', '') or '',
+                'language':  vol.get('language', '') or '',
+                'genre':     categories[0] if categories else 'Audiobook',
+                'asin':      '',
+                'isbn':      isbn,
+                'copyright': '',
             })
         return results
     except Exception:
@@ -521,21 +755,34 @@ def _search_open_library(query: str) -> list:
     try:
         data = _fetch_json(
             f"https://openlibrary.org/search.json"
-            f"?q={query}&fields=title,author_name,first_publish_year,cover_i&limit={API_SEARCH_LIMIT}"
+            f"?q={query}&fields=title,author_name,first_publish_year,cover_i,publisher,isbn,language"
+            f"&limit={API_SEARCH_LIMIT}"
         )
         results = []
         for doc in data.get('docs', []):
             cover_id  = doc.get('cover_i')
             cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else ''
+            publishers = doc.get('publisher') or []
+            isbns      = doc.get('isbn') or []
+            langs      = doc.get('language') or []
             results.append({
-                'title':     clean_title(doc.get('title', 'Unknown')),
-                'author':    (doc.get('author_name') or ['Unknown'])[0],
-                'year':      str(doc.get('first_publish_year', '')),
-                'cover_url': cover_url,
-                'desc':      '',   # search endpoint doesn't return descriptions
-                'source':    'Open Library',
-                'series':    '',
-                'narrator':  '',
+                'title':       clean_title(doc.get('title', 'Unknown')),
+                'author':      (doc.get('author_name') or ['Unknown'])[0],
+                'year':        str(doc.get('first_publish_year', '')),
+                'date':        str(doc.get('first_publish_year', '')),
+                'cover_url':   cover_url,
+                'desc':        '',   # search endpoint doesn't return descriptions
+                'source':      'Open Library',
+                'series':      '',
+                'series_part': '',
+                'narrator':    '',
+                'publisher':   publishers[0] if publishers else '',
+                'language':    langs[0] if langs else '',
+                'genre':       'Audiobook',
+                'asin':        '',
+                # OL often returns 13-digit first when available
+                'isbn':        next((i for i in isbns if len(i) == 13), isbns[0] if isbns else ''),
+                'copyright':   '',
             })
         return results
     except Exception:
@@ -543,7 +790,8 @@ def _search_open_library(query: str) -> list:
 
 
 def _search_audnexus(title: str, author: str) -> list:
-    """Search Audnexus (Audible data bridge) — audiobook-specific, returns series/position info."""
+    """Search Audnexus (Audible data bridge) — audiobook-specific, returns
+    series/position, narrator, ASIN, publisher, language, genres."""
     try:
         params = f"title={urllib.parse.quote(title.strip())}"
         if author.strip():
@@ -554,24 +802,42 @@ def _search_audnexus(title: str, author: str) -> list:
         for item in items:
             authors    = item.get('authors', [])
             author_str = authors[0].get('name', 'Unknown') if authors else 'Unknown'
-            series_parts = item.get('series', [])
             series_str   = ''
+            series_pos   = ''
+            series_parts = item.get('series', []) or []
             if series_parts and isinstance(series_parts, list):
                 s          = series_parts[0]
-                s_title    = s.get('title', '')
-                s_pos      = s.get('position', '')
-                series_str = f"{s_title} #{s_pos}" if s_pos else s_title
-            narrators    = item.get('narrators', [])
+                series_str = s.get('title', '') or ''
+                series_pos = str(s.get('position', '') or '')
+            narrators    = item.get('narrators', []) or []
             narrator_str = narrators[0].get('name', '') if narrators else ''
+            genres_list  = item.get('genres', []) or []
+            # Audnexus genres are list of {name, type}; pull the first 'genre'
+            # entry, falling back to anything we can find.
+            primary_genre = ''
+            for g in genres_list:
+                if g.get('type', '').lower() == 'genre' and g.get('name'):
+                    primary_genre = g['name']
+                    break
+            if not primary_genre and genres_list:
+                primary_genre = genres_list[0].get('name', '') or ''
             out.append({
-                'title':     clean_title(item.get('title', 'Unknown')),
-                'author':    author_str,
-                'year':      (item.get('releaseDate', '') or '')[:4],
-                'cover_url': item.get('image', ''),
-                'desc':      strip_html(item.get('summary', '')),
-                'source':    'Audnexus',
-                'series':    series_str,
-                'narrator':  narrator_str,
+                'title':       clean_title(item.get('title', 'Unknown')),
+                'author':      author_str,
+                'year':        (item.get('releaseDate', '') or '')[:4],
+                'date':        (item.get('releaseDate', '') or '')[:10],
+                'cover_url':   item.get('image', ''),
+                'desc':        strip_html(item.get('summary', '')),
+                'source':      'Audnexus',
+                'series':      series_str,
+                'series_part': series_pos,
+                'narrator':    narrator_str,
+                'publisher':   item.get('publisherName', '') or '',
+                'language':    item.get('language', '') or '',
+                'genre':       primary_genre or 'Audiobook',
+                'asin':        item.get('asin', '') or '',
+                'isbn':        '',  # not in Audible payload
+                'copyright':   item.get('copyright', '') or '',
             })
         return out
     except Exception:
@@ -676,26 +942,48 @@ def _flush_stdin():
         pass
 
 
+def _result_to_meta(r: dict, fallback_title: str = '', fallback_author: str = '') -> BookMetadata:
+    """Convert a provider search result dict into a BookMetadata."""
+    return BookMetadata(
+        title       = r.get('title', '') or fallback_title,
+        author      = r.get('author', '') or fallback_author,
+        narrator    = r.get('narrator', '') or '',
+        series      = r.get('series', '') or '',
+        series_part = r.get('series_part', '') or '',
+        description = r.get('desc', '') or '',
+        publisher   = r.get('publisher', '') or '',
+        date        = r.get('date', '') or r.get('year', '') or '',
+        language    = r.get('language', '') or '',
+        genre       = r.get('genre', '') or 'Audiobook',
+        asin        = r.get('asin', '') or '',
+        isbn        = r.get('isbn', '') or '',
+        copyright_  = r.get('copyright', '') or '',
+        cover_url   = r.get('cover_url', '') or '',
+    )
+
+
+def _local_meta(title: str, author: str) -> BookMetadata:
+    """Build a 'skip' / no-lookup BookMetadata from local info only."""
+    return BookMetadata(title=title, author=author)
+
+
 def interactive_lookup(
     title: str,
     author: str,
     auto_lookup: bool = False,
     no_lookup: bool = False,
-) -> tuple:
-    """
-    Interactively (or automatically) select metadata for a book.
-    Returns (title, author, cover_url, description, series, narrator, aborted).
+) -> tuple[BookMetadata | None, bool]:
+    """Interactively (or automatically) select metadata for a book.
+
+    Returns (BookMetadata, aborted). When aborted=True, the metadata is None.
     """
     if no_lookup:
-        return title, author, None, '', '', '', False
+        return _local_meta(title, author), False
 
     if NON_INTERACTIVE and not auto_lookup:
-        # GUI / cron / pipe context — no human to prompt. Abort this book
-        # rather than block on input(). If the caller wanted a "best effort"
-        # fill instead they'd have passed --auto-lookup.
         log.warning(f"Non-interactive mode and no cached decision for '{title}' — aborting this book")
         print(f"[!] No cached decision for '{title}' and non-interactive mode set — skipping.")
-        return None, None, None, None, None, None, True
+        return None, True
 
     _flush_stdin()
     norm_author = normalise_author(author)
@@ -706,32 +994,32 @@ def interactive_lookup(
         print("    [!] No results found online.")
         if auto_lookup:
             print("    [~] Auto-lookup: skipping online metadata, using local info.")
-            return title, norm_author, None, '', '', '', False
+            return _local_meta(title, norm_author), False
     else:
         if auto_lookup:
             res   = results[0]
             score = _score_result(res, title, norm_author)
             if score < SCORE_AUTO_SELECT_THRESHOLD:
                 print(f"    [~] Auto-lookup: best match score {score:.2f} is too low — using local info.")
-                return title, norm_author, None, '', '', '', False
-            flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
-            series_tag = f"  [{res['series']}]" if res.get('series') else ''
+                return _local_meta(title, norm_author), False
+            flags        = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
+            series_tag   = f"  [{res['series']}]" if res.get('series') else ''
             narrator_tag = f"  (narrated by {res['narrator']})" if res.get('narrator') else ''
             print(f"    [+] Auto-selected: {res['title']}{series_tag}{narrator_tag}  score={score:.2f}  {flags}")
             log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}{narrator_tag}  score={score:.2f}{flags}")
-            return res['title'], res['author'], res['cover_url'], res['desc'], res.get('series', ''), res.get('narrator', ''), False
+            return _result_to_meta(res, title, norm_author), False
 
         if (
             len(results) == 1
             and _score_result(results[0], title, norm_author) >= SCORE_SINGLE_RESULT_THRESHOLD
         ):
-            res   = results[0]
-            flags      = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
-            series_tag = f"  [{res['series']}]" if res.get('series') else ''
+            res          = results[0]
+            flags        = ('[Cover]' if res['cover_url'] else '') + (' [Summary]' if res['desc'] else '')
+            series_tag   = f"  [{res['series']}]" if res.get('series') else ''
             narrator_tag = f"  (narrated by {res['narrator']})" if res.get('narrator') else ''
             print(f"    [+] Auto-selecting match: {res['title']}{series_tag}{narrator_tag}  {flags}")
             log.info(f"Metadata [{res['source']}]: \"{res['title']}\" by {res['author']}{series_tag}{narrator_tag}{flags}")
-            return res['title'], res['author'], res['cover_url'], res['desc'], res.get('series', ''), res.get('narrator', ''), False
+            return _result_to_meta(res, title, norm_author), False
 
         print("\n" + "=" * 60 + "\n ONLINE RESULTS (best match first)\n" + "=" * 60)
         for i, res in enumerate(results, 1):
@@ -762,22 +1050,20 @@ def interactive_lookup(
                 narrator_tag = f"  (narrated by {s['narrator']})" if s.get('narrator') else ''
                 score        = _score_result(s, title, norm_author)
                 log.info(f"Metadata [{s['source']}]: \"{s['title']}\" by {s['author']}{series_tag}{narrator_tag}  score={score:.2f}")
-                return s['title'], s['author'], s['cover_url'], s['desc'], s.get('series', ''), s.get('narrator', ''), False
+                return _result_to_meta(s, title, norm_author), False
             elif choice == skip_opt:
                 log.info(f"Metadata [local]: \"{title}\" by {norm_author}")
-                return title, norm_author, None, '', '', '', False
+                return _local_meta(title, norm_author), False
             elif choice == manual_opt:
                 new_title  = input("    New title: ").strip() or title
                 new_author = input("    New author (blank = keep): ").strip() or norm_author
                 return interactive_lookup(new_title, new_author, auto_lookup=False, no_lookup=False)
             elif choice == abort_opt:
                 log.warning(f"Aborted by user")
-                return None, None, None, None, None, None, True
+                return None, True
         except ValueError:
             pass
         except EOFError:
-            # Stdin closed (cron / nohup / pipe broken). Spinning the loop
-            # would burn 100% CPU forever — exit instead.
             log.error("Stdin closed (EOF). Cannot prompt for metadata. Exiting.")
             print("\n[!] Stdin closed — exiting (cannot prompt interactively).")
             sys.exit(1)
@@ -1221,55 +1507,31 @@ def _download_cover(cover_url: str, dest: Path) -> Path | None:
         return None
 
 
-def retag_m4b(
-    source_file: Path,
-    book_title: str,
-    book_author: str,
-    cover_url: str | None,
-    book_desc: str,
-    book_series: str = '',
-    book_narrator: str = '',
-) -> bool:
-    """Overwrite metadata tags on an existing .m4b in-place (stream-copy, no re-encode)."""
+def retag_m4b(source_file: Path, meta: BookMetadata) -> bool:
+    """Overwrite metadata tags on an existing .m4b in-place (stream-copy)."""
     tmp_out = source_file.with_suffix('.retag.m4b')
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp       = Path(tmpdir)
         meta_file = tmp / 'metadata.txt'
-        cover_file = None
+        cover_file: Path | None = None
 
-        if cover_url:
-            cover_file = _download_cover(cover_url, tmp / 'cover.jpg')
+        if meta.cover_url:
+            cover_file = _download_cover(meta.cover_url, tmp / 'cover.jpg')
 
         with open(meta_file, 'w', encoding='utf-8') as fm:
-            fm.write(';FFMETADATA1\n')
-            fm.write(f"title={_ffmeta_escape(book_title)}\n")
-            fm.write(f"artist={_ffmeta_escape(book_author)}\n")
-            fm.write(f"album={_ffmeta_escape(book_title)}\n")
-            fm.write("genre=Audiobook\n")
-            if book_series:
-                fm.write(f"grouping={_ffmeta_escape(book_series)}\n")
-            if book_narrator:
-                fm.write(f"composer={_ffmeta_escape(book_narrator)}\n")
-            if book_desc:
-                desc_escaped = _ffmeta_escape(book_desc)
-                fm.write(f"comment={desc_escaped}\n")
-                fm.write(f"description={desc_escaped}\n")
+            fm.write(render_book_ffmetadata(meta))
 
         cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'error',
                '-i', str(source_file), '-i', str(meta_file)]
         if cover_file and cover_file.exists():
-            # New cover replaces whatever was embedded. Map audio from input 0,
-            # cover image from input 2. Existing attached_pic in input 0 is
-            # intentionally dropped.
-            cmd += ['-i', str(cover_file),
-                    '-map', '0:a', '-map', '2:0',
-                    '-c:v', 'mjpeg', '-disposition:v:0', 'attached_pic']
+            # New cover replaces whatever was embedded. Normalize to JPEG
+            # ≤2000px so Apple Books / BookPlayer don't choke on PNGs or
+            # oversized images.
+            cmd += cover_input_args(cover_file, audio_input_index=0, cover_input_index=2)
         else:
             # No new cover supplied — preserve everything the source has
-            # (audio + the existing attached_pic + any extra streams). Using
-            # `-map 0:a` here would silently strip the cover, leaving the
-            # output untagged-visually.
+            # (audio + the existing attached_pic + any extra streams).
             cmd += ['-map', '0', '-c:v', 'copy']
         cmd += ['-map_metadata', '1', '-map_chapters', '0',
                 '-c:a', 'copy', '-movflags', '+faststart', str(tmp_out)]
@@ -1291,7 +1553,7 @@ def retag_m4b(
 
     shutil.move(str(tmp_out), str(source_file))
     print(f"[+] Retagged in place: {source_file.name}")
-    log.info(f"Retagged: {source_file.name}  →  {book_title} by {book_author}")
+    log.info(f"Retagged: {source_file.name}  →  {meta.title} by {meta.author}")
     return True
 
 
@@ -1357,33 +1619,23 @@ def process_book(
     # --- Single .m4b: already converted -----------------------------------
     if len(files) == 1 and files[0].suffix.lower() == '.m4b':
         if cached_decision and not cached_decision.get('aborted'):
-            print(f"    [*] Using cached decision: \"{cached_decision['title']}\" by {cached_decision['author']}")
-            book_title   = cached_decision['title']
-            book_author  = cached_decision['author']
-            cover_url    = cached_decision.get('cover_url')
-            book_desc    = cached_decision.get('desc', '')
-            book_series  = cached_decision.get('series', '')
-            book_narrator = cached_decision.get('narrator', '')
+            meta = BookMetadata.from_decision(cached_decision)
+            print(f"    [*] Using cached decision: \"{meta.title}\" by {meta.author}")
             abort = False
         else:
-            book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
-                early_title, early_author, auto_lookup, no_lookup,
-            )
+            meta, abort = interactive_lookup(early_title, early_author, auto_lookup, no_lookup)
             # Don't cache aborts: otherwise the user can't retry a single
-            # aborted folder without --clear-cache (which wipes everything).
-            if not abort and decision_cache is not None and cache_path is not None:
-                _save_decision(cache_path, decision_cache, cache_key, {
-                    'title': book_title or '', 'author': book_author or '',
-                    'cover_url': cover_url, 'desc': book_desc or '',
-                    'series': book_series or '', 'narrator': book_narrator or '',
-                    'timestamp': datetime.now().isoformat(),
-                })
-        if abort:
-            print("[!] Aborted by user.")
+            # aborted folder without --clear-cache.
+            if not abort and meta is not None and decision_cache is not None and cache_path is not None:
+                entry = meta.to_decision()
+                entry['timestamp'] = datetime.now().isoformat()
+                _save_decision(cache_path, decision_cache, cache_key, entry)
+        if abort or meta is None:
+            print("[!] Aborted.")
             return
 
-        safe_author     = truncate_author(book_author)
-        output_filename = safe_filename(safe_author, book_title)
+        safe_author     = truncate_author(meta.author)
+        output_filename = safe_filename(safe_author, meta.title)
         output_file     = output_dir / output_filename
 
         if output_file.exists():
@@ -1392,8 +1644,8 @@ def process_book(
             return
 
         print(f"[*] Single .m4b: {files[0].name}")
-        print(f"    Title:  {book_title}")
-        print(f"    Author: {book_author}")
+        print(f"    Title:  {meta.title}")
+        print(f"    Author: {meta.author}")
 
         if dry_run:
             print(f"[~] Dry run — would copy to: {output_file}")
@@ -1404,17 +1656,10 @@ def process_book(
         print(f"[+] Copied: {output_file.name}")
         log.info(f"Copied: {files[0].name}  →  {output_filename}")
 
-        # Retag if user picked online metadata, OR the chosen title/author
-        # differs from what was probed off the source file. Previously this
-        # only fired when cover/desc/series/narrator was present, so picking
-        # an online result that only corrected the title/author left the
-        # output file with stale embedded tags.
-        should_retag = (
-            cover_url or book_desc or book_series or book_narrator
-            or book_title != early_title or book_author != early_author
-        )
-        if should_retag:
-            retag_m4b(output_file, book_title, book_author, cover_url, book_desc, book_series, book_narrator)
+        # Always retag the copy — even when the user 'skipped' lookup, we want
+        # to embed our standard atom set (stik=Audiobook, pgap, sort tags,
+        # genre=Audiobook). retag is a stream-copy remux, so it's cheap.
+        retag_m4b(output_file, meta)
 
         if existing_stems is not None:
             existing_stems.append(strip_author_prefix(output_file.stem.lower()))
@@ -1442,40 +1687,28 @@ def process_book(
         return
 
     if cached_decision and not cached_decision.get('aborted'):
-        print(f"    [*] Using cached decision: \"{cached_decision['title']}\" by {cached_decision['author']}")
-        book_title    = cached_decision['title']
-        book_author   = cached_decision['author']
-        cover_url     = cached_decision.get('cover_url')
-        book_desc     = cached_decision.get('desc', '')
-        book_series   = cached_decision.get('series', '')
-        book_narrator = cached_decision.get('narrator', '')
+        meta = BookMetadata.from_decision(cached_decision)
+        print(f"    [*] Using cached decision: \"{meta.title}\" by {meta.author}")
         abort = False
     else:
-        book_title, book_author, cover_url, book_desc, book_series, book_narrator, abort = interactive_lookup(
-            early_title, early_author, auto_lookup, no_lookup,
-        )
-        # Don't cache aborts: otherwise the user can't retry a single
-        # aborted folder without --clear-cache (which wipes everything).
-        if not abort and decision_cache is not None and cache_path is not None:
-            _save_decision(cache_path, decision_cache, cache_key, {
-                'title': book_title or '', 'author': book_author or '',
-                'cover_url': cover_url, 'desc': book_desc or '',
-                'series': book_series or '', 'narrator': book_narrator or '',
-                'timestamp': datetime.now().isoformat(),
-            })
-    if abort:
-        print("[!] Aborted by user.")
+        meta, abort = interactive_lookup(early_title, early_author, auto_lookup, no_lookup)
+        if not abort and meta is not None and decision_cache is not None and cache_path is not None:
+            entry = meta.to_decision()
+            entry['timestamp'] = datetime.now().isoformat()
+            _save_decision(cache_path, decision_cache, cache_key, entry)
+    if abort or meta is None:
+        print("[!] Aborted.")
         return
 
-    safe_author     = truncate_author(book_author)
-    output_filename = safe_filename(safe_author, book_title)
+    safe_author     = truncate_author(meta.author)
+    output_filename = safe_filename(safe_author, meta.title)
     output_file     = output_dir / output_filename
 
     # Re-check duplicates with the final (post-lookup) title
     if existing_stems is not None:
-        final_check = strip_author_prefix(book_title.lower()) if ' - ' in book_title else book_title.lower()
+        final_check = strip_author_prefix(meta.title.lower()) if ' - ' in meta.title else meta.title.lower()
         if final_check != check_title and already_exists(final_check, existing_stems):
-            print(f"[!] Post-lookup title '{book_title}' matches an existing file — skipping.")
+            print(f"[!] Post-lookup title '{meta.title}' matches an existing file — skipping.")
             log.info(f"Skipped (duplicate after lookup): {book_dir.name}")
             return
 
@@ -1497,10 +1730,10 @@ def process_book(
         tmp         = Path(tmpdir)
         concat_list = tmp / 'concat.txt'
         meta_file   = tmp / 'metadata.txt'
-        cover_file  = None
+        cover_file: Path | None = None
 
-        if cover_url:
-            cover_file = _download_cover(cover_url, tmp / 'cover.jpg')
+        if meta.cover_url:
+            cover_file = _download_cover(meta.cover_url, tmp / 'cover.jpg')
 
         codecs       = {t['codec'] for t in track_data}
         sample_rates = {t['sample_rate'] for t in track_data}
@@ -1611,64 +1844,52 @@ def process_book(
                 print("    [!] No chapter markers detected via speech recognition.")
                 log.info("Chapterize: no chapter markers detected")
 
-        with open(concat_list, 'w', encoding='utf-8') as fc, \
-             open(meta_file,   'w', encoding='utf-8') as fm:
+        # --- Build the chapter list (either speech-detected or per-track) --
+        chapter_specs: list[tuple[int, int, str]] = []
+        if speech_chapters:
+            total_ms = int(total_sec * 1000)
+            for idx, (ch_ts, ch_title) in enumerate(speech_chapters):
+                # Force chapter 1 to t=0 so there's no unchaptered region at
+                # the start of the file (Apple Books and some Android players
+                # glitch otherwise).
+                start_ms = 0 if idx == 0 else int(ch_ts * 1000)
+                end_ms = (int(speech_chapters[idx + 1][0] * 1000)
+                          if idx + 1 < len(speech_chapters) else total_ms)
+                chapter_specs.append((start_ms, end_ms, ch_title))
+        else:
+            for i, t in enumerate(track_data):
+                dur_ms = int(t['duration'] * 1000)
+                chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
+                chapter_specs.append((curr_ms, curr_ms + dur_ms, chapter_title))
+                curr_ms += dur_ms
 
-            fm.write(';FFMETADATA1\n')
-            fm.write(f"title={_ffmeta_escape(book_title)}\n")
-            fm.write(f"artist={_ffmeta_escape(book_author)}\n")
-            fm.write(f"album={_ffmeta_escape(book_title)}\n")
-            fm.write("genre=Audiobook\n")
-            if book_series:
-                fm.write(f"grouping={_ffmeta_escape(book_series)}\n")
-            if book_narrator:
-                fm.write(f"composer={_ffmeta_escape(book_narrator)}\n")
-                print(f"    [+] Narrator: {book_narrator}")
-            if book_desc:
-                desc_escaped = _ffmeta_escape(book_desc)
-                fm.write(f"comment={desc_escaped}\n")
-                fm.write(f"description={desc_escaped}\n")
-            fm.write('\n')
-
+        # --- Write concat list and FFMETADATA file -------------------------
+        with open(concat_list, 'w', encoding='utf-8') as fc:
             if speech_chapters:
-                # Single file — write chapters from speech detection timestamps
                 fc.write(f"file '{track_data[0]['concat_target']}'\n")
-                total_ms = int(total_sec * 1000)
-                for idx, (ch_ts, ch_title) in enumerate(speech_chapters):
-                    # Force first chapter to t=0 so there's no unchaptered
-                    # region at the start of the file — some players (Apple
-                    # Books, several Android apps) glitch on chapter 1 != 0.
-                    start_ms = 0 if idx == 0 else int(ch_ts * 1000)
-                    if idx + 1 < len(speech_chapters):
-                        end_ms = int(speech_chapters[idx + 1][0] * 1000)
-                    else:
-                        end_ms = total_ms
-                    fm.write(f"[CHAPTER]\nTIMEBASE=1/1000\n")
-                    fm.write(f"START={start_ms}\nEND={end_ms}\n")
-                    fm.write(f"title={_ffmeta_escape(ch_title)}\n\n")
             else:
-                for i, t in enumerate(track_data):
+                for t in track_data:
                     fc.write(f"file '{t['concat_target']}'\n")
-                    dur_ms        = int(t['duration'] * 1000)
-                    chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
-                    fm.write(f"[CHAPTER]\nTIMEBASE=1/1000\n")
-                    fm.write(f"START={curr_ms}\nEND={curr_ms + dur_ms}\n")
-                    fm.write(f"title={_ffmeta_escape(chapter_title)}\n\n")
-                    curr_ms += dur_ms
 
+        with open(meta_file, 'w', encoding='utf-8') as fm:
+            fm.write(render_book_ffmetadata(meta, chapter_specs))
+
+        if meta.narrator:
+            print(f"    [+] Narrator: {meta.narrator}")
+        if meta.series:
+            series_disp = f"{meta.series} #{meta.series_part}" if meta.series_part else meta.series
+            print(f"    [+] Series:   {series_disp}")
+        if meta.asin:
+            print(f"    [+] ASIN:     {meta.asin}")
+
+        # --- Build the ffmpeg assembly command -----------------------------
         cmd = [
             'ffmpeg', '-y', '-nostdin',
             '-f', 'concat', '-safe', '0', '-i', str(concat_list),
             '-i', str(meta_file),
         ]
         if cover_file and cover_file.exists():
-            cmd += [
-                '-i', str(cover_file),
-                '-map', '0:a',
-                '-map', '2:0',
-                '-c:v', 'mjpeg',
-                '-disposition:v:0', 'attached_pic',
-            ]
+            cmd += cover_input_args(cover_file, audio_input_index=0, cover_input_index=2)
         else:
             cmd += ['-map', '0:a']
 

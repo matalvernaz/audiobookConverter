@@ -117,6 +117,12 @@ _ensure_bundled_tools_on_path()
 
 log = logging.getLogger('ab')
 
+# Module-level: when True, any code path that would prompt the user instead
+# logs a warning and aborts the affected book. Set by main() from
+# --non-interactive. Used by the merge prompt, interactive metadata picker,
+# and the chapterize confirm.
+NON_INTERACTIVE = False
+
 
 def setup_logging(log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +135,26 @@ def setup_logging(log_path: Path) -> None:
     log.addHandler(fh)
     log.setLevel(logging.DEBUG)
     log.info(f"Log file: {log_path}")
+
+
+def _log_tool_versions() -> None:
+    """Resolve and log the ffmpeg/ffprobe binaries actually in use.
+
+    Catches misconfiguration loudly: a stale PyInstaller bundle path, an
+    architecture-mismatched binary on PATH, an outdated ffmpeg without atoms
+    we depend on (e.g. modern `show`/`episode_id`), etc.
+    """
+    for tool in ('ffmpeg', 'ffprobe'):
+        resolved = shutil.which(tool) or '<not found on PATH>'
+        version = '?'
+        if resolved != '<not found on PATH>':
+            try:
+                out = subprocess.run([tool, '-version'], capture_output=True,
+                                     text=True, timeout=10).stdout
+                version = (out.splitlines() or ['?'])[0].strip()
+            except Exception as e:
+                version = f'<failed to query: {e}>'
+        log.info(f"{tool}: {resolved}  ({version})")
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +689,14 @@ def interactive_lookup(
     if no_lookup:
         return title, author, None, '', '', '', False
 
+    if NON_INTERACTIVE and not auto_lookup:
+        # GUI / cron / pipe context — no human to prompt. Abort this book
+        # rather than block on input(). If the caller wanted a "best effort"
+        # fill instead they'd have passed --auto-lookup.
+        log.warning(f"Non-interactive mode and no cached decision for '{title}' — aborting this book")
+        print(f"[!] No cached decision for '{title}' and non-interactive mode set — skipping.")
+        return None, None, None, None, None, None, True
+
     _flush_stdin()
     norm_author = normalise_author(author)
     print(f"\n[*] Searching online for: '{title}' by {norm_author} …")
@@ -818,6 +852,10 @@ def find_audiobooks(
             print(f"{'=' * 60}")
             if prompt_merge is not None:
                 merge = bool(prompt_merge(parent.name, subfolder_names))
+            elif NON_INTERACTIVE:
+                merge = False
+                log.info(f"Non-interactive: defaulting merge=No for {parent.name}")
+                print(f"[*] Non-interactive: keeping {len(children)} subfolder(s) separate.")
             else:
                 _flush_stdin()
                 try:
@@ -1221,11 +1259,18 @@ def retag_m4b(
         cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'error',
                '-i', str(source_file), '-i', str(meta_file)]
         if cover_file and cover_file.exists():
+            # New cover replaces whatever was embedded. Map audio from input 0,
+            # cover image from input 2. Existing attached_pic in input 0 is
+            # intentionally dropped.
             cmd += ['-i', str(cover_file),
                     '-map', '0:a', '-map', '2:0',
                     '-c:v', 'mjpeg', '-disposition:v:0', 'attached_pic']
         else:
-            cmd += ['-map', '0:a']
+            # No new cover supplied — preserve everything the source has
+            # (audio + the existing attached_pic + any extra streams). Using
+            # `-map 0:a` here would silently strip the cover, leaving the
+            # output untagged-visually.
+            cmd += ['-map', '0', '-c:v', 'copy']
         cmd += ['-map_metadata', '1', '-map_chapters', '0',
                 '-c:a', 'copy', '-movflags', '+faststart', str(tmp_out)]
 
@@ -1505,23 +1550,28 @@ def process_book(
             for t in track_data:
                 t['target'] = t['path']
 
-        # Stage every input as a numbered symlink inside tmpdir so the concat
+        # Stage every input under a numbered name inside tmpdir so the concat
         # list never contains apostrophes / spaces / special characters from
-        # the source filenames. tmpdir paths are /tmp/tmpXXXXXX and are safe.
+        # the source filenames. Try cheapest first: symlink → hardlink → copy.
+        # Windows non-admin accounts can't create symlinks without Developer
+        # Mode; hardlinks fail across volumes; copy always works.
         for i, t in enumerate(track_data):
             link_name = f"input_{i:04d}{t['target'].suffix or '.m4a'}"
             link_path = tmp / link_name
-            if link_path != t['target']:
-                if link_path.exists() or link_path.is_symlink():
-                    link_path.unlink()
-                try:
-                    link_path.symlink_to(t['target'])
-                except OSError:
-                    # Fallback: hardlink if symlinks aren't supported (rare)
-                    os.link(t['target'], link_path)
-                t['concat_target'] = link_path
-            else:
+            if link_path == t['target']:
                 t['concat_target'] = t['target']
+                continue
+            if link_path.exists() or link_path.is_symlink():
+                link_path.unlink()
+            try:
+                link_path.symlink_to(t['target'])
+            except (OSError, NotImplementedError):
+                try:
+                    os.link(t['target'], link_path)
+                except (OSError, NotImplementedError):
+                    shutil.copy2(t['target'], link_path)
+                    log.debug(f"Concat staging copied (no symlink/hardlink): {t['target'].name}")
+            t['concat_target'] = link_path
 
         total_sec = sum(t['duration'] for t in track_data)
         curr_ms   = 0
@@ -1540,10 +1590,10 @@ def process_book(
                     h, m = divmod(m, 60)
                     print(f"        {h:02d}:{m:02d}:{s:02d}  {ch_title}")
                     log.info(f"Chapterize:   {h:02d}:{m:02d}:{s:02d}  {ch_title}")
-                if accept_chapters:
+                if accept_chapters or NON_INTERACTIVE:
                     speech_chapters = detected
-                    print("    [+] Auto-accepting detected chapters (--accept-chapters).")
-                    log.info("Chapterize: chapters auto-accepted via --accept-chapters")
+                    print("    [+] Auto-accepting detected chapters.")
+                    log.info("Chapterize: chapters auto-accepted")
                 else:
                     _flush_stdin()
                     try:
@@ -1663,12 +1713,16 @@ def main():
     parser.add_argument('--no-lookup',     action='store_true', help='Skip all online metadata lookups')
     parser.add_argument('--chapterize',    action='store_true', help='Detect chapters via speech recognition for single-file audiobooks (requires: pip install faster-whisper)')
     parser.add_argument('--accept-chapters', action='store_true', help='When --chapterize is used, accept the detected chapters without prompting (for non-interactive / GUI use)')
+    parser.add_argument('--non-interactive', action='store_true', help='Fail fast instead of prompting. Use when launching from a GUI / cron / pipe — any cache-miss that would otherwise need a prompt aborts the book cleanly.')
     parser.add_argument('--skip-transcode-errors', action='store_true', help='Continue assembly even when some files fail to transcode')
     parser.add_argument('--clear-cache',  action='store_true', help='Clear cached interactive decisions and re-prompt for everything')
     parser.add_argument('--re-prompt', metavar='PATH', nargs='+', default=[],
                         help='Drop cached decisions for these specific folder paths so the script will re-prompt for them; leaves the rest of the cache intact. May be passed multiple paths.')
     parser.add_argument('--log', metavar='FILE', help='Log file path (default: ab_TIMESTAMP.log in output dir)')
     args = parser.parse_args()
+
+    global NON_INTERACTIVE
+    NON_INTERACTIVE = bool(args.non_interactive)
 
     in_p  = Path(args.input).resolve()
     out_p = Path(args.output).resolve()
@@ -1681,9 +1735,10 @@ def main():
 
     log_path = Path(args.log) if args.log else out_p / f"ab_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     setup_logging(log_path)
+    _log_tool_versions()
     log.info(f"Input:  {in_p}")
     log.info(f"Output: {out_p}")
-    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}  accept_chapters={args.accept_chapters}  skip_transcode_errors={args.skip_transcode_errors}")
+    log.info(f"Flags:  bitrate={args.bitrate}  dry_run={args.dry_run}  auto_lookup={args.auto_lookup}  no_lookup={args.no_lookup}  chapterize={args.chapterize}  accept_chapters={args.accept_chapters}  non_interactive={args.non_interactive}  skip_transcode_errors={args.skip_transcode_errors}")
     print(f"[*] Logging to: {log_path}")
 
     # Decision cache — remembers interactive choices across restarts

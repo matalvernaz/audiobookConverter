@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import signal
 import subprocess
 import sys
 import threading
@@ -414,6 +416,22 @@ class ConversionDialog(wx.Dialog):
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
     def start(self):
+        # Put the child in its own process group/session so we can kill its
+        # whole tree on cancel — otherwise on Windows the ffmpeg subprocess
+        # survives the Python wrapper and keeps running.
+        popen_kwargs = {}
+        if platform.system() == 'Windows':
+            popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+
+        # Force the child to flush stdout per line and emit UTF-8 — without
+        # these env vars Windows can batch output for seconds at a time and
+        # mojibake any non-ASCII title/author in the log pane.
+        env = dict(os.environ)
+        env['PYTHONUNBUFFERED'] = '1'
+        env['PYTHONIOENCODING'] = 'utf-8'
+
         try:
             self.process = subprocess.Popen(
                 self.command,
@@ -425,6 +443,8 @@ class ConversionDialog(wx.Dialog):
                 text=True,
                 encoding='utf-8',
                 errors='replace',
+                env=env,
+                **popen_kwargs,
             )
         except Exception as e:
             self.log.AppendText(f'Failed to start ab.py: {e}\n')
@@ -436,6 +456,30 @@ class ConversionDialog(wx.Dialog):
         self.status.SetLabel('Running…')
         self._reader_thread = threading.Thread(target=self._reader, daemon=True)
         self._reader_thread.start()
+
+    def _kill_process_tree(self):
+        """Kill the conversion subprocess and any ffmpeg children.
+
+        terminate() on the wrapper alone leaves ffmpeg running on Windows;
+        we have to tear the whole process group/job down.
+        """
+        if not self.process or self.process.poll() is not None:
+            return
+        try:
+            if platform.system() == 'Windows':
+                subprocess.run(
+                    ['taskkill', '/T', '/F', '/PID', str(self.process.pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+            else:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+        except Exception:
+            # Last-ditch: kill the wrapper at least.
+            try:
+                self.process.kill()
+            except Exception:
+                pass
 
     def _reader(self):
         assert self.process and self.process.stdout
@@ -470,10 +514,7 @@ class ConversionDialog(wx.Dialog):
                 self,
             ) == wx.YES:
                 self._cancelled = True
-                try:
-                    self.process.terminate()
-                except Exception:
-                    pass
+                self._kill_process_tree()
 
     def on_close(self, evt):
         if self.process and self.process.poll() is None:
@@ -943,13 +984,17 @@ class MainFrame(wx.Frame):
             in_p,
             '-o', out_p,
             '-b', self.bitrate_ctrl.GetValue() or DEFAULT_BITRATE,
+            # Belt-and-braces: the decision cache is fully populated before we
+            # launch, so ab.py shouldn't need to prompt. But if something
+            # slipped through, --non-interactive makes the CLI fail fast on
+            # that book instead of hanging on input() waiting for a tty.
+            '--non-interactive',
+            '--accept-chapters',
         ]
         if self.auto_lookup_ctrl.GetValue():
             cmd.append('--auto-lookup')
         if self.skip_transcode_ctrl.GetValue():
             cmd.append('--skip-transcode-errors')
-        # Cache is fully populated, so ab.py shouldn't prompt. But guard against
-        # any edge-case prompt by closing stdin.
 
         self._save_prefs()
 

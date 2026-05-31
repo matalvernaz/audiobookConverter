@@ -788,10 +788,18 @@ class MainFrame(wx.Frame):
             result = {'ans': False}
 
             def show():
-                dlg = MergeDialog(self, parent_name, children)
-                result['ans'] = (dlg.ShowModal() == wx.ID_YES)
-                dlg.Destroy()
-                done.set()
+                # Always set the event, even if dialog construction/ShowModal
+                # raises — otherwise the scan thread blocks on done.wait() forever.
+                try:
+                    dlg = MergeDialog(self, parent_name, children)
+                    try:
+                        result['ans'] = (dlg.ShowModal() == wx.ID_YES)
+                    finally:
+                        dlg.Destroy()
+                except Exception:
+                    ab.log.exception("Merge dialog failed; defaulting to keep-separate")
+                finally:
+                    done.set()
 
             wx.CallAfter(show)
             done.wait()

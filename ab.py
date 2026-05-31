@@ -76,6 +76,7 @@ SILENCE_MIN_DURATION = 0.5            # minimum silence duration in seconds
 FOLDER_NAME_MIN_ADVANTAGE = 8        # folder must be this many chars longer than album
 
 MAX_AUTHOR_LEN = 50                   # truncation limit for author in filenames
+MAX_TITLE_LEN = 120                   # truncation limit for title in filenames (keeps paths under Windows MAX_PATH)
 DECISION_CACHE_FILE = '.ab_decisions.json'  # persists interactive choices across restarts
 MAX_TRANSCODE_WORKERS = None          # None = use all CPU cores for parallel transcoding
 TRANSCODE_TIMEOUT = 3600              # per-file transcode timeout in seconds (60 min)
@@ -91,6 +92,17 @@ MERGE_CACHE_PREFIX = 'merge:'                     # decision cache key prefix fo
 LOUDNORM_I   = -18.0
 LOUDNORM_TP  = -1.5
 LOUDNORM_LRA = 11.0
+
+# iTunes returns an ISO-3166 country (e.g. 'us'), not a language. The m4b
+# `language` atom expects ISO-639-2 (e.g. 'eng'), which ABS/Plex/Apple use for
+# their language filters. Map the common audiobook storefronts; unknown
+# countries leave language blank rather than emit a bogus code.
+ITUNES_COUNTRY_TO_LANG = {
+    'us': 'eng', 'gb': 'eng', 'ca': 'eng', 'au': 'eng', 'ie': 'eng', 'nz': 'eng',
+    'de': 'deu', 'at': 'deu', 'fr': 'fra', 'es': 'spa', 'mx': 'spa', 'it': 'ita',
+    'br': 'por', 'pt': 'por', 'nl': 'nld', 'se': 'swe', 'no': 'nor', 'dk': 'dan',
+    'fi': 'fin', 'jp': 'jpn', 'ru': 'rus', 'pl': 'pol',
+}
 
 _PLACEHOLDER_ARTISTS = frozenset({
     'artist', 'unknown', 'unknown author', 'unknown artist',
@@ -182,12 +194,21 @@ def title_words(s: str) -> set:
 
 
 def titles_match(a: str, b: str, word_threshold: float = DUPE_WORD_THRESHOLD, seq_threshold: float = DUPE_SEQ_THRESHOLD) -> bool:
+    """True when two titles are close enough to be the same book.
+
+    Word score is Jaccard (intersection / union), NOT intersection / smaller —
+    the latter scores any subset title 1.0, so "Dune" would falsely match
+    "Dune Messiah" and get skipped as a duplicate. Jaccard gives 1/2 = 0.5
+    there, while genuine dupes (near-identical word sets) still clear the
+    threshold. The SequenceMatcher fallback catches near-identical strings that
+    the word set misses (minor punctuation / spelling differences).
+    """
     words_a = title_words(a)
     words_b = title_words(b)
     if words_a and words_b:
         overlap = len(words_a & words_b)
-        smaller = min(len(words_a), len(words_b))
-        if (overlap / smaller) >= word_threshold:
+        union   = len(words_a | words_b)
+        if union and (overlap / union) >= word_threshold:
             return True
     return SequenceMatcher(None, a.lower(), b.lower()).ratio() >= seq_threshold
 
@@ -486,8 +507,21 @@ def _sanitize_filename_part(s: str) -> str:
     return cleaned
 
 
+def _truncate_title_part(title: str, max_len: int = MAX_TITLE_LEN) -> str:
+    """Bound a title for use in a filename. Trims on a word boundary when one
+    is reasonably close to the limit so we don't cut mid-word."""
+    if len(title) <= max_len:
+        return title
+    clipped = title[:max_len]
+    cut = clipped.rfind(' ')
+    if cut >= max_len - 20:
+        clipped = clipped[:cut]
+    return clipped.rstrip(' -_.')
+
+
 def safe_filename(author: str, title: str) -> str:
-    return f"{_sanitize_filename_part(author)} - {_sanitize_filename_part(title)}.m4b"
+    safe_title = _truncate_title_part(_sanitize_filename_part(title))
+    return f"{_sanitize_filename_part(author)} - {safe_title}.m4b"
 
 
 def truncate_author(author: str, max_len: int = MAX_AUTHOR_LEN) -> str:
@@ -741,7 +775,7 @@ def _search_itunes(query: str) -> list:
                 'series_part': '',
                 'narrator':  '',
                 'publisher': '',
-                'language':  item.get('country', '').lower(),  # rough proxy (e.g. 'us')
+                'language':  ITUNES_COUNTRY_TO_LANG.get(item.get('country', '').lower(), ''),
                 'genre':     item.get('primaryGenreName', '') or 'Audiobook',
                 'asin':      '',
                 'isbn':      '',
@@ -1138,18 +1172,26 @@ def find_audiobooks(
     root       = input_dir.resolve()
     all_files  = [p for p in root.rglob('*') if p.suffix.lower() in AUDIO_EXTS]
     books: dict = {}
-    loose_count = 0
+    loose_files: list[Path] = []
 
     for file in all_files:
         parent   = file.parent
         book_dir = parent.parent if STRUCTURAL_FOLDER_RE.search(parent.name) else parent
         if book_dir == root:
-            loose_count += 1
+            loose_files.append(file)
             continue
         books.setdefault(book_dir, []).append(file)
 
-    if loose_count:
-        print(f"[!] Ignored {loose_count} loose audio file(s) sitting directly in the root folder.")
+    # Files sitting directly in the root are normally stray junk in a library
+    # tree and get ignored. But if the root contains ONLY loose files (no
+    # per-book subfolders), the user pointed us at a single book's own folder —
+    # treat the root itself as that book rather than finding nothing.
+    if loose_files:
+        if not books:
+            books[root] = loose_files
+            print(f"[*] Treating input folder as a single book ({len(loose_files)} file(s)).")
+        else:
+            print(f"[!] Ignored {len(loose_files)} loose audio file(s) sitting directly in the root folder.")
 
     # Consolidation: when a non-root folder has multiple child folders that
     # each contain a single audio file, ask the user whether to merge them
@@ -1569,7 +1611,6 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     # --- parse results in timestamp order; deduplicate chapter numbers -----
     raw_results.sort(key=lambda x: x[0])
     chapters: list[tuple[float, str]] = []
-    seen_nums: set = set()
 
     for ts, words in raw_results:
         for i, w in enumerate(words):
@@ -1592,8 +1633,11 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
                 if nw in _ORDINALS:
                     num = _ORDINALS[nw]
                     break
-            if num and num not in seen_nums:
-                seen_nums.add(num)
+            # Don't dedup by number: candidates are already ≥MIN_SPACING apart so
+            # the same announcement can't appear twice, and a book that resets
+            # numbering per part ("Part 2, Chapter 1") legitimately repeats a
+            # number — dropping repeats would merge those chapters.
+            if num:
                 title = f"{word.capitalize()} {num}"
                 chapters.append((word_ts, title))
                 log.debug(f"Chapterize: '{title}' at {word_ts:.1f}s")

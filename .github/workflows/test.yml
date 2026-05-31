@@ -1,0 +1,25 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The unit tests cover only the pure logic (title cleaning, dedup, author
+      # normalisation, filename safety, scoring, series-number parsing) — no
+      # ffmpeg, network or wxPython needed, so no dependencies to install.
+      - name: Run unit tests
+        run: python -m unittest test_ab.py -v

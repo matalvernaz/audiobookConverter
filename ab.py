@@ -66,6 +66,19 @@ TITLE_VARIANT_MIN_LEN = 5             # min chars for colon-split primary varian
 DUPE_WORD_THRESHOLD = 0.85
 DUPE_SEQ_THRESHOLD = 0.90
 
+# Output verification tolerances.
+# Source-vs-output must be TIGHT — it's the same audio. A small ABSOLUTE slack
+# absorbs AAC encoder priming/padding accumulated across concatenated files
+# (tens of ms each); a percentage here would be a trap — 1% of a 40h book is 24
+# minutes, enough to hide a whole dropped chapter behind an "OK".
+VERIFY_SOURCE_TOLERANCE_SEC = 15
+# Online editions genuinely differ (intro/outro, narrator pacing, rounding), so
+# allow a percentage — but cap it, or 5% of a 25h omnibus (75 min) would hide a
+# missing disc.
+VERIFY_EDITION_TOLERANCE_PCT     = 0.05
+VERIFY_EDITION_TOLERANCE_CAP_SEC = 900   # 15 min hard cap on edition slack
+VERIFY_REPORT_SUFFIX = '.ab_report.txt'
+
 # Chapterize settings
 CHAPTERIZE_CLIP_SEC = 20              # seconds of audio to examine after each silence
 CHAPTERIZE_MIN_SPACING = 120          # ignore silence gaps within 2 min of previous candidate
@@ -288,6 +301,7 @@ class BookMetadata:
     copyright_: str = ''      # avoid shadowing builtin
     cover_url: str = ''
     cover_path: Path | None = None
+    runtime_min: str = ''     # online edition runtime in minutes (Audnexus); verify-only, never tagged
 
     @classmethod
     def from_decision(cls, d: dict | None) -> 'BookMetadata':
@@ -310,6 +324,7 @@ class BookMetadata:
             isbn        = d.get('isbn', '')        or '',
             copyright_  = d.get('copyright', '')   or '',
             cover_url   = d.get('cover_url')       or '',
+            runtime_min = str(d.get('runtime_min', '') or ''),
         )
 
     def to_decision(self) -> dict:
@@ -329,6 +344,7 @@ class BookMetadata:
             'isbn':        self.isbn,
             'copyright':   self.copyright_,
             'cover_url':   self.cover_url or None,
+            'runtime_min': self.runtime_min or '',
         }
 
 
@@ -919,6 +935,7 @@ def _search_audnexus(title: str, author: str) -> list:
                 'asin':        item.get('asin', '') or '',
                 'isbn':        '',  # not in Audible payload
                 'copyright':   item.get('copyright', '') or '',
+                'runtime_min': str(item.get('runtimeLengthMin', '') or ''),
             })
         return out
     except Exception:
@@ -1042,6 +1059,7 @@ def _result_to_meta(r: dict, fallback_title: str = '', fallback_author: str = ''
         isbn        = r.get('isbn', '') or '',
         copyright_  = r.get('copyright', '') or '',
         cover_url   = r.get('cover_url', '') or '',
+        runtime_min = str(r.get('runtime_min', '') or ''),
     )
 
 
@@ -1712,6 +1730,212 @@ def retag_m4b(source_file: Path, meta: BookMetadata) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Output verification — a screen-reader-friendly "trust but verify" report.
+# Nothing here mutates the audiobook; it only probes the finished file and
+# compares it to what we expected to produce.
+# ---------------------------------------------------------------------------
+
+def _fmt_hms(seconds: float) -> str:
+    s = int(round(seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+def _within_tolerance(actual: float, expected: float, abs_tol: float, pct_tol: float) -> bool:
+    """True when `actual` is within max(abs_tol, expected*pct_tol) of `expected`."""
+    tol = max(abs_tol, expected * pct_tol)
+    return abs(actual - expected) <= tol
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """Parse a float from ffprobe output, tolerating None / 'N/A' / junk."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _probe_for_verify(path: Path) -> dict | None:
+    """ffprobe a finished file for verification (format, streams, chapters,
+    tags). Returns None if the file can't be opened at all."""
+    cmd = [
+        'ffprobe', '-v', 'quiet', '-print_format', 'json',
+        '-show_format', '-show_streams', '-show_chapters', str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+    except Exception:
+        return None
+
+
+def _emit_verify_report(output_file: Path, header: str,
+                        checks: list[tuple[str, str]], write_report: bool) -> dict:
+    """Print, log, and (optionally) write a sidecar for a list of
+    (level, message) checks. level is one of OK / WARN / FAIL."""
+    n_ok   = sum(1 for lvl, _ in checks if lvl == 'OK')
+    n_warn = sum(1 for lvl, _ in checks if lvl == 'WARN')
+    n_fail = sum(1 for lvl, _ in checks if lvl == 'FAIL')
+    summary = f"{n_ok} OK" + (f", {n_warn} warning(s)" if n_warn else '') + (f", {n_fail} failure(s)" if n_fail else '')
+
+    console_marks = {'OK': '[+]', 'WARN': '[!]', 'FAIL': '[X]'}
+    print(f"\n[verify] {header}")
+    for lvl, msg in checks:
+        print(f"    {console_marks.get(lvl, '[?]')} {msg}")
+    print(f"    => {summary}")
+
+    log.info(f"Verify: {header} — {summary}")
+    for lvl, msg in checks:
+        (log.warning if lvl in ('WARN', 'FAIL') else log.info)(f"Verify:   {lvl} {msg}")
+
+    report_text = '\n'.join([f"Verification: {header}"]
+                            + [f"    {lvl:4s} {msg}" for lvl, msg in checks]
+                            + [f"    -> {summary}"])
+    if write_report:
+        try:
+            report_path = output_file.parent / (output_file.stem + VERIFY_REPORT_SUFFIX)
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(report_text + '\n')
+        except OSError as e:
+            log.warning(f"Could not write verify report: {e}")
+
+    return {'ok': n_ok, 'warn': n_warn, 'fail': n_fail, 'checks': checks, 'text': report_text}
+
+
+def verify_output(output_file: Path, meta: BookMetadata,
+                  expected_duration_sec: float, expected_chapters: int | None,
+                  write_report: bool = True) -> dict:
+    """Check a finished .m4b against expectations and emit a linear report.
+
+    Checks file validity, source-vs-output duration, online-edition runtime
+    (when Audnexus gave us one), chapter count + ordering, cover art, codec and
+    the core tags. The duration-delta check is the load-bearing one: it catches
+    ffmpeg truncations and dropped source files that are otherwise invisible
+    until you hit a gap mid-listen.
+    """
+    header = (meta.title or output_file.stem) + (f" by {meta.author}" if meta.author else '')
+    data = _probe_for_verify(output_file)
+    if data is None:
+        return _emit_verify_report(
+            output_file, header,
+            [('FAIL', 'Output could not be opened by ffprobe — it may be corrupt.')],
+            write_report,
+        )
+
+    fmt      = data.get('format', {})
+    streams  = data.get('streams', [])
+    chapters = data.get('chapters', [])
+    audio    = [s for s in streams if s.get('codec_type') == 'audio']
+    video    = [s for s in streams if s.get('codec_type') == 'video']
+    tags     = {k.lower(): v for k, v in (fmt.get('tags') or {}).items()}
+    checks: list[tuple[str, str]] = []
+
+    # 1. Validity + codec + stream count
+    if not audio:
+        checks.append(('FAIL', 'No audio stream in output.'))
+    elif len(audio) != 1:
+        checks.append(('WARN', f'{len(audio)} audio streams found; expected exactly 1.'))
+    else:
+        codec = audio[0].get('codec_name', '?')
+        checks.append(('OK', 'Valid file, 1 audio stream (AAC).') if codec == 'aac'
+                       else ('WARN', f'Audio codec is {codec}, expected AAC.'))
+
+    out_dur = _safe_float(fmt.get('duration'))
+
+    # 2. Duration vs source audio — tight absolute tolerance, no percentage.
+    if out_dur <= 0:
+        checks.append(('WARN', 'Output duration could not be read.'))
+    elif expected_duration_sec > 0:
+        delta = abs(out_dur - expected_duration_sec)
+        if _within_tolerance(out_dur, expected_duration_sec, VERIFY_SOURCE_TOLERANCE_SEC, 0.0):
+            checks.append(('OK', f'Duration {_fmt_hms(out_dur)} matches source (delta {int(delta)}s).'))
+        else:
+            direction = 'shorter' if out_dur < expected_duration_sec else 'longer'
+            checks.append(('WARN', f'Output is {_fmt_hms(delta)} {direction} than the source '
+                                   f'({_fmt_hms(out_dur)} vs {_fmt_hms(expected_duration_sec)}) — possible truncation or dropped file.'))
+
+    # 3. Duration vs online edition runtime (Audnexus, when known)
+    try:
+        runtime_min = int(float(meta.runtime_min)) if meta.runtime_min else 0
+    except (TypeError, ValueError):
+        runtime_min = 0
+    if runtime_min > 0 and out_dur > 0:
+        edition_sec = runtime_min * 60
+        delta = abs(out_dur - edition_sec)
+        edition_tol = min(edition_sec * VERIFY_EDITION_TOLERANCE_PCT, VERIFY_EDITION_TOLERANCE_CAP_SEC)
+        if delta <= edition_tol:
+            checks.append(('OK', f'Matches the online edition runtime (~{_fmt_hms(edition_sec)}).'))
+        else:
+            direction = 'shorter' if out_dur < edition_sec else 'longer'
+            checks.append(('WARN', f'Output is {_fmt_hms(delta)} {direction} than the online edition '
+                                   f'({_fmt_hms(out_dur)} vs ~{_fmt_hms(edition_sec)}) — could be a missing file/disc, or just a different edition.'))
+
+    # 4. Chapters
+    if chapters:
+        starts = [_safe_float(c.get('start_time')) for c in chapters]
+        ends   = [_safe_float(c.get('end_time'))   for c in chapters]
+        # Non-decreasing starts; a same-start pair is a zero-length chapter,
+        # which the `positive` check reports with a clearer message.
+        ordered  = all(starts[i] <= starts[i + 1] for i in range(len(starts) - 1))
+        positive = all(ends[i] > starts[i] for i in range(len(chapters)))
+        # Coverage: chapters should span the file — first near t=0, last ending
+        # near the audio end. A gap means part of the book has no chapter, which
+        # breaks nonvisual navigation.
+        covers_start = starts[0] <= VERIFY_SOURCE_TOLERANCE_SEC
+        covers_end   = (out_dur <= 0) or (ends[-1] >= out_dur - VERIFY_SOURCE_TOLERANCE_SEC)
+        if expected_chapters is not None and len(chapters) != expected_chapters:
+            checks.append(('WARN', f'{len(chapters)} chapters in output, expected {expected_chapters}.'))
+        elif not ordered:
+            checks.append(('WARN', f'{len(chapters)} chapters present but not in time order.'))
+        elif not positive:
+            checks.append(('WARN', f'{len(chapters)} chapters present but at least one has zero length.'))
+        elif not (covers_start and covers_end):
+            checks.append(('WARN', f'{len(chapters)} chapters present but they do not span the whole file '
+                                   f'(first starts at {_fmt_hms(starts[0])}, last ends at {_fmt_hms(ends[-1])} of {_fmt_hms(out_dur)}).'))
+        else:
+            checks.append(('OK', f'{len(chapters)} chapters, in order and spanning the file.'))
+    elif expected_chapters:
+        checks.append(('WARN', f'No chapters in output, expected {expected_chapters}.'))
+    else:
+        checks.append(('WARN', 'No chapters in output.'))
+
+    # 5. Cover art. Only a real attached_pic counts; a non-cover video stream
+    # must NOT pass as a cover. And "no cover" is only a problem if we actually
+    # had one to embed — otherwise it's expected, not a warning.
+    def _is_attached_pic(v) -> bool:
+        val = (v.get('disposition') or {}).get('attached_pic')
+        return val == 1 or val is True or str(val) == '1'
+
+    if any(_is_attached_pic(v) for v in video):
+        checks.append(('OK', 'Cover art embedded.'))
+    elif video:
+        checks.append(('WARN', 'A video stream is present but not marked as cover art.'))
+    elif meta.cover_url:
+        checks.append(('WARN', 'Cover art was available but is not embedded in the output.'))
+    else:
+        checks.append(('OK', 'No cover art (none was available).'))
+
+    # 6. Core tags. Author is written to both artist and album_artist, and some
+    # muxers/players expose only one — accept any author-ish key so a healthy
+    # file doesn't false-WARN.
+    title_present  = bool(tags.get('title') or tags.get('album'))
+    author_present = bool(tags.get('artist') or tags.get('album_artist') or tags.get('author'))
+    present = [name for name, key in (('title', 'title'), ('author', 'artist'),
+                                      ('album', 'album'), ('narrator', 'composer'),
+                                      ('series', 'show')) if tags.get(key)]
+    missing_core = ([] if title_present else ['title']) + ([] if author_present else ['author'])
+    if missing_core:
+        checks.append(('WARN', f"Missing core tag(s): {', '.join(missing_core)}."))
+    else:
+        checks.append(('OK', f"Tags present: {', '.join(present) or 'title, author'}."))
+
+    return _emit_verify_report(output_file, header, checks, write_report)
+
+
+# ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
 
@@ -1730,6 +1954,7 @@ def process_book(
     normalize: bool = False,
     decision_cache: dict | None = None,
     cache_path: Path | None = None,
+    verify: bool = True,
 ):
     print(f"\n{'=' * 60}")
     print(f"  Audiobook: {book_dir.name}")
@@ -1815,6 +2040,12 @@ def process_book(
         # to embed our standard atom set (stik=Audiobook, pgap, sort tags,
         # genre=Audiobook). retag is a stream-copy remux, so it's cheap.
         retag_m4b(output_file, meta)
+
+        if verify:
+            src_dur = float(initial.get('duration', 0) or 0) if initial else 0.0
+            # Source chapters are preserved as-is on a stream-copy retag, so we
+            # don't assert a specific count for the single-file path.
+            verify_output(output_file, meta, src_dur, expected_chapters=None)
 
         if existing_stems is not None:
             existing_stems.append(strip_author_prefix(output_file.stem.lower()))
@@ -2086,6 +2317,9 @@ def process_book(
     print(f"[+] Created: {output_file.name}")
     log.info(f"Created: {output_file.name}  ({len(track_data)} track(s), {'stream-copy' if can_copy else bitrate})")
 
+    if verify:
+        verify_output(output_file, meta, total_sec, expected_chapters=len(chapter_specs))
+
     if existing_stems is not None:
         existing_stems.append(strip_author_prefix(output_file.stem.lower()))
 
@@ -2109,6 +2343,7 @@ def main():
     parser.add_argument('--non-interactive', action='store_true', help='Fail fast instead of prompting. Use when launching from a GUI / cron / pipe — any cache-miss that would otherwise need a prompt aborts the book cleanly.')
     parser.add_argument('--skip-transcode-errors', action='store_true', help='Continue assembly even when some files fail to transcode')
     parser.add_argument('--normalize', action='store_true', help=f'Loudness-normalize each file to {LOUDNORM_I:g} LUFS (EBU R128, two-pass, linear). Skip for full-cast productions where dynamic range is intentional.')
+    parser.add_argument('--no-verify', action='store_true', help='Skip the post-build verification report (duration/chapter/tag/cover checks + .ab_report.txt sidecar).')
     parser.add_argument('--clear-cache',  action='store_true', help='Clear cached interactive decisions and re-prompt for everything')
     parser.add_argument('--re-prompt', metavar='PATH', nargs='+', default=[],
                         help='Drop cached decisions for these specific folder paths so the script will re-prompt for them; leaves the rest of the cache intact. May be passed multiple paths.')
@@ -2193,6 +2428,7 @@ def main():
             normalize=args.normalize,
             decision_cache=decision_cache,
             cache_path=cache_path,
+            verify=not args.no_verify,
         )
 
     log.info("Done")

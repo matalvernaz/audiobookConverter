@@ -9,9 +9,15 @@ series-number parsing. Run with either:
     pytest test_ab.py
 """
 
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 import ab
+
+_HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 # series.py is a local-only utility (gitignored, not shipped with the converter),
 # so its tests only run where the file is present.
@@ -173,6 +179,73 @@ class ScoreResultTests(unittest.TestCase):
         score = ab._score_result(self._r("Completely Different Book"),
                                  "Mistborn", "")
         self.assertLessEqual(score, ab.SCORE_KEYWORD_ANCHOR_CAP + 1e-9)
+
+
+class VerifyHelperTests(unittest.TestCase):
+    def test_fmt_hms(self):
+        self.assertEqual(ab._fmt_hms(0), "0:00:00")
+        self.assertEqual(ab._fmt_hms(3723), "1:02:03")
+        self.assertEqual(ab._fmt_hms(59.6), "0:01:00")  # rounds
+
+    def test_within_tolerance_absolute_floor(self):
+        # 3s delta on a tiny expected value passes via the 5s absolute floor.
+        self.assertTrue(ab._within_tolerance(13, 10, 5, 0.01))
+
+    def test_within_tolerance_percentage(self):
+        # 1% of 40000s = 400s; a 300s delta is within tolerance.
+        self.assertTrue(ab._within_tolerance(40300, 40000, 5, 0.01))
+
+    def test_outside_tolerance(self):
+        self.assertFalse(ab._within_tolerance(41000, 40000, 5, 0.01))
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, "ffmpeg/ffprobe not on PATH")
+class VerifyOutputE2ETests(unittest.TestCase):
+    """Build a real chaptered .m4b and run the verifier against it."""
+
+    def _build_m4b(self, tmp: Path, seconds: int = 4) -> ab.BookMetadata:
+        src = tmp / "src.m4a"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"sine=frequency=440:duration={seconds}",
+             "-c:a", "aac", "-b:a", "64k", str(src)],
+            check=True, capture_output=True, timeout=60,
+        )
+        meta = ab.BookMetadata(title="Test Book", author="Test Author")
+        half = (seconds * 1000) // 2
+        specs = [(0, half, "Chapter 1"), (half, seconds * 1000, "Chapter 2")]
+        meta_file = tmp / "meta.txt"
+        meta_file.write_text(ab.render_book_ffmetadata(meta, specs), encoding="utf-8")
+        self.out = tmp / "Test Author - Test Book.m4b"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-i", str(meta_file),
+             "-map", "0:a", "-map_metadata", "1", "-map_chapters", "1",
+             "-c:a", "copy", "-f", "ipod", str(self.out)],
+            check=True, capture_output=True, timeout=60,
+        )
+        return meta
+
+    def test_clean_build_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            meta = self._build_m4b(tmp, seconds=4)
+            result = ab.verify_output(self.out, meta, expected_duration_sec=4.0,
+                                      expected_chapters=2, write_report=False)
+            self.assertEqual(result["fail"], 0)
+            messages = " ".join(m for _, m in result["checks"])
+            self.assertIn("2 chapters, in order", messages)
+            self.assertIn("Tags present", messages)
+
+    def test_short_output_flags_duration(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            meta = self._build_m4b(tmp, seconds=4)
+            # Claim the source was 10 minutes — output is far shorter, must warn.
+            result = ab.verify_output(self.out, meta, expected_duration_sec=600.0,
+                                      expected_chapters=2, write_report=False)
+            self.assertGreaterEqual(result["warn"], 1)
+            self.assertTrue(any(lvl == "WARN" and "shorter" in msg
+                                for lvl, msg in result["checks"]))
 
 
 @unittest.skipUnless(HAVE_SERIES, "series.py not present (local-only utility)")

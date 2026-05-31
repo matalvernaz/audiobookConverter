@@ -1,7 +1,6 @@
 # Local-only utility scripts (not part of the converter)
 audiobook-maker.sh
 organize_torrented.py
-series.py
 
 # Tool/editor cruft
 .claude/

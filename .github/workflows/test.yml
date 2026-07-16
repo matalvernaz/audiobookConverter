@@ -18,8 +18,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      # The unit tests cover only the pure logic (title cleaning, dedup, author
-      # normalisation, filename safety, scoring, series-number parsing) — no
-      # ffmpeg, network or wxPython needed, so no dependencies to install.
+      # Most tests cover pure logic (title cleaning, dedup, author
+      # normalisation, filename safety, scoring, series-number parsing), but the
+      # verify_output end-to-end tests build and probe a real .m4b, so ffmpeg is
+      # needed for full coverage — without it those tests silently skip.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Run unit tests
         run: python -m unittest test_ab.py -v

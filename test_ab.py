@@ -19,8 +19,8 @@ import ab
 
 _HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
-# series.py is a local-only utility (gitignored, not shipped with the converter),
-# so its tests only run where the file is present.
+# series.py is a companion organiser tracked alongside the converter. Import is
+# still guarded so the ab.py tests can run even if it's ever absent.
 try:
     import series
     HAVE_SERIES = True
@@ -283,6 +283,201 @@ class UniquePathTests(unittest.TestCase):
             p.write_bytes(b"x")
             out = series.unique_path(p)
             self.assertEqual(out.name, "a (2).m4b")
+
+
+class NormalizeLanguageTests(unittest.TestCase):
+    def test_full_english_word(self):
+        self.assertEqual(ab.normalize_language("english"), "eng")
+
+    def test_two_letter_code(self):
+        self.assertEqual(ab.normalize_language("en"), "eng")
+        self.assertEqual(ab.normalize_language("de"), "deu")
+
+    def test_three_letter_passthrough(self):
+        # A valid ISO-639-2 code we didn't enumerate is trusted as-is.
+        self.assertEqual(ab.normalize_language("ces"), "ces")
+
+    def test_unknown_blanked(self):
+        self.assertEqual(ab.normalize_language("zz"), "")
+        self.assertEqual(ab.normalize_language(""), "")
+        self.assertEqual(ab.normalize_language("klingon"), "")
+
+    def test_case_insensitive(self):
+        self.assertEqual(ab.normalize_language("English"), "eng")
+
+
+class LanguageStreamArgsTests(unittest.TestCase):
+    def test_known_language_emitted(self):
+        m = ab.BookMetadata(language="english")
+        self.assertEqual(ab._language_stream_args(m), ["-metadata:s:a:0", "language=eng"])
+
+    def test_unknown_language_empty(self):
+        self.assertEqual(ab._language_stream_args(ab.BookMetadata(language="")), [])
+        self.assertEqual(ab._language_stream_args(ab.BookMetadata(language="zz")), [])
+
+
+class MergeResultTests(unittest.TestCase):
+    def _base(self, **kw):
+        d = {"title": "T", "author": "A", "source": "iTunes", "cover_url": "",
+             "desc": "", "series": "", "series_part": "", "narrator": "",
+             "publisher": "", "language": "", "genre": "Audiobook", "asin": "", "isbn": ""}
+        d.update(kw)
+        return d
+
+    def test_backfills_empty_fields(self):
+        kept = self._base()
+        ab._merge_result(kept, self._base(source="Audnexus", series="S",
+                                          series_part="2", narrator="N", asin="X"))
+        self.assertEqual(kept["series"], "S")
+        self.assertEqual(kept["narrator"], "N")
+        self.assertEqual(kept["asin"], "X")
+
+    def test_does_not_overwrite_existing(self):
+        kept = self._base(narrator="Original")
+        ab._merge_result(kept, self._base(narrator="Other"))
+        self.assertEqual(kept["narrator"], "Original")
+
+    def test_generic_genre_replaced(self):
+        kept = self._base(genre="Audiobook")
+        ab._merge_result(kept, self._base(genre="Science Fiction"))
+        self.assertEqual(kept["genre"], "Science Fiction")
+
+    def test_source_promoted_on_series_gain(self):
+        kept = self._base(source="iTunes")
+        ab._merge_result(kept, self._base(source="Audnexus", series="S"))
+        self.assertIn("Audnexus", kept["source"])
+        self.assertIn("iTunes", kept["source"])
+
+
+class ScoreRichnessTests(unittest.TestCase):
+    def test_richer_result_wins_tie(self):
+        # Same title+author match; the one with series + narrator should rank
+        # higher so Audnexus data isn't buried under a bare edition.
+        bare = {"title": "Mistborn", "author": "Brandon Sanderson",
+                "series": "", "narrator": "", "desc": "", "cover_url": ""}
+        rich = {"title": "Mistborn", "author": "Brandon Sanderson",
+                "series": "Mistborn", "series_part": "1",
+                "narrator": "Michael Kramer", "desc": "d", "cover_url": "u"}
+        s_bare = ab._score_result(bare, "Mistborn", "Brandon Sanderson")
+        s_rich = ab._score_result(rich, "Mistborn", "Brandon Sanderson")
+        self.assertGreater(s_rich, s_bare)
+
+
+class LooksLikeImageTests(unittest.TestCase):
+    def test_real_images_accepted(self):
+        self.assertTrue(ab._looks_like_image(b"\xff\xd8\xff\xe0..."))       # JPEG
+        self.assertTrue(ab._looks_like_image(b"\x89PNG\r\n\x1a\n..."))      # PNG
+
+    def test_non_images_rejected(self):
+        self.assertFalse(ab._looks_like_image(b"<!DOCTYPE html><html>"))
+        self.assertFalse(ab._looks_like_image(b""))
+
+
+class FetchAudnexusBookParseTests(unittest.TestCase):
+    """_fetch_audnexus_book parsing, with the network call stubbed."""
+
+    _PAYLOAD = {
+        "asin": "B002V0QCYU", "title": "The Final Empire",
+        "authors": [{"name": "Brandon Sanderson"}],
+        "narrators": [{"name": "Michael Kramer"}],
+        "seriesPrimary": {"name": "The Mistborn Saga", "position": "1"},
+        "genres": [{"name": "Science Fiction & Fantasy", "type": "genre"}],
+        "language": "english", "publisherName": "Macmillan Audio",
+        "releaseDate": "2006-07-17T00:00:00.000Z", "runtimeLengthMin": 1479,
+        "isbn": "9780765311788", "copyright": 2006,
+        "summary": "<p>Once, a hero rose to save the world.</p>", "description": "Once.",
+    }
+
+    def _with_stub(self, payload, fn):
+        orig = ab._fetch_json
+        ab._fetch_json = lambda url, timeout=ab.API_TIMEOUT: payload
+        try:
+            return fn()
+        finally:
+            ab._fetch_json = orig
+
+    def test_parses_series_language_genre(self):
+        r = self._with_stub(self._PAYLOAD, lambda: ab._fetch_audnexus_book("B002V0QCYU"))
+        self.assertEqual(r["series"], "The Mistborn Saga")
+        self.assertEqual(r["series_part"], "1")
+        self.assertEqual(r["narrator"], "Michael Kramer")
+        self.assertEqual(r["language"], "eng")
+        self.assertEqual(r["genre"], "Science Fiction & Fantasy")
+        self.assertEqual(r["runtime_min"], "1479")
+        self.assertEqual(r["source"], "Audnexus")
+        self.assertNotIn("<p>", r["desc"])
+
+    def test_missing_title_returns_none(self):
+        self.assertIsNone(self._with_stub({"asin": "x"},
+                                          lambda: ab._fetch_audnexus_book("x")))
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, "ffmpeg/ffprobe not on PATH")
+class SourceMetadataE2ETests(unittest.TestCase):
+    """Build real .m4b files and exercise tag backfill, chapter probing, and
+    the track-scaled verify tolerance."""
+
+    def _make_m4b(self, path: Path, seconds: int = 4, tags=None, chapters=None):
+        lines = [";FFMETADATA1"]
+        for k, v in (tags or {}).items():
+            lines.append(f"{k}={v}")
+        for (s, e, t) in (chapters or []):
+            lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={s}", f"END={e}", f"title={t}"]
+        meta = path.parent / "m.txt"
+        meta.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"sine=frequency=440:duration={seconds}", "-i", str(meta),
+             "-map", "0:a", "-map_metadata", "1", "-map_chapters", "1",
+             "-c:a", "aac", "-f", "ipod", str(path)],
+            check=True, capture_output=True, timeout=60,
+        )
+
+    def test_backfill_preserves_source_tags(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "b.m4b"
+            self._make_m4b(src, tags={"title": "T", "artist": "A", "composer": "Narr",
+                                      "description": "Desc", "show": "Ser",
+                                      "episode_id": "3", "genre": "Horror"})
+            merged = ab._backfill_meta_from_source(ab.BookMetadata(title="T", author="A"), src)
+            self.assertEqual(merged.narrator, "Narr")
+            self.assertEqual(merged.description, "Desc")
+            self.assertEqual(merged.series, "Ser")
+            self.assertEqual(merged.series_part, "3")
+            self.assertEqual(merged.genre, "Horror")
+
+    def test_backfill_does_not_overwrite_chosen(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "b.m4b"
+            self._make_m4b(src, tags={"composer": "SourceNarr"})
+            merged = ab._backfill_meta_from_source(
+                ab.BookMetadata(title="T", author="A", narrator="ChosenNarr"), src)
+            self.assertEqual(merged.narrator, "ChosenNarr")
+
+    def test_probe_source_chapters(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "b.m4b"
+            self._make_m4b(src, seconds=9,
+                           chapters=[(0, 3000, "One"), (3000, 6000, "Two"), (6000, 9000, "Three")])
+            specs = ab._probe_source_chapters(src)
+            self.assertEqual(len(specs), 3)
+            self.assertEqual(specs[0], (0, 3000, "One"))
+
+    def test_verify_tolerance_scales_with_track_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "b.m4b"
+            self._make_m4b(src, seconds=4, chapters=[(0, 4000, "One")])
+            meta = ab.BookMetadata(title="T", author="A")
+            # Actual 4s vs claimed 24s = 20s delta. 1 track: tol 15s -> WARN;
+            # 400 tracks: tol 24s -> within tolerance, no duration WARN.
+            r1 = ab.verify_output(src, meta, 24.0, expected_chapters=1,
+                                  write_report=False, source_tracks=1)
+            r400 = ab.verify_output(src, meta, 24.0, expected_chapters=1,
+                                    write_report=False, source_tracks=400)
+            dur_warn = lambda res: any(lvl == "WARN" and "than the source" in m
+                                       for lvl, m in res["checks"])
+            self.assertTrue(dur_warn(r1))
+            self.assertFalse(dur_warn(r400))
 
 
 if __name__ == "__main__":

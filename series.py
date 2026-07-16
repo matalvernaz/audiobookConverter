@@ -94,6 +94,46 @@ def clean_title(title):
     cleaned = re.sub(r'\s+series$', '', cleaned, flags=re.IGNORECASE)
     return cleaned.strip(' -_,')
 
+AUDIBLE_CATALOG_URL = "https://api.audible.com/1.0/catalog/products"
+AUDNEXUS_BOOK_URL = "https://api.audnex.us/books"
+AUDNEXUS_REGION = "us"
+
+
+def _audible_asins(query, limit=5):
+    """Resolve candidate ASINs via Audible's public catalog search.
+
+    Audnexus has no title-search route (a bare /books?title= returns 404), so
+    ASINs must be resolved here first, then looked up in Audnexus by ASIN."""
+    try:
+        # `keywords` (free-text), not `title`: callers pass combined
+        # title+author queries, which the stricter title filter won't match.
+        params = urllib.parse.urlencode({
+            "keywords": query, "num_results": limit, "products_sort_by": "Relevance",
+        })
+        req = urllib.request.Request(f"{AUDIBLE_CATALOG_URL}?{params}",
+                                     headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=7) as response:
+            data = json.loads(response.read())
+        return [p["asin"] for p in (data.get("products") or []) if p.get("asin")]
+    except Exception:
+        return []
+
+
+def _audnexus_series(asin):
+    """Return the primary series name for an ASIN via Audnexus, or '' if none."""
+    try:
+        url = f"{AUDNEXUS_BOOK_URL}/{urllib.parse.quote(asin)}?region={AUDNEXUS_REGION}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=7) as response:
+            data = json.loads(response.read())
+        sp = data.get("seriesPrimary") if isinstance(data, dict) else None
+        if isinstance(sp, dict):
+            return (sp.get("name") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def fetch_series_roster(author, series):
     titles = set()
     author_query = author if author and author.lower() != "unknown" else ""
@@ -137,21 +177,14 @@ _series_patterns = [
 def hunt_for_series_clue(title, author):
     author_query = author if author and author.lower() != "unknown" else ""
     
-    # 1. AUDNEXUS (Audible Bridge) - The Gold Standard
-    try:
-        t_query = urllib.parse.quote(title)
-        a_query = urllib.parse.quote(author_query)
-        url = f"https://api.audnex.us/books?title={t_query}&author={a_query}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=7) as response:
-            data = json.loads(response.read())
-            # Audnexus usually returns an array directly or inside 'data'/'results'
-            results = data.get('data', data.get('results', [])) if isinstance(data, dict) else data
-            for item in results:
-                series_info = item.get('series', [])
-                if series_info and isinstance(series_info, list):
-                    return series_info[0].get('title', '').strip()
-    except Exception: pass
+    # 1. AUDNEXUS (Audible Bridge) - The Gold Standard.
+    #    Resolve ASINs via Audible catalog, then read seriesPrimary from the
+    #    book record (Audnexus has no title search).
+    audnexus_query = f"{title} {author_query}".strip()
+    for asin in _audible_asins(audnexus_query, limit=3):
+        name = _audnexus_series(asin)
+        if name:
+            return name
 
     # 2. APPLE ITUNES FALLBACK
     try:
@@ -223,21 +256,11 @@ def search_series(query):
                     series_names.add(m.group(1).strip())
     except Exception: pass
 
-    # Audnexus
-    try:
-        q = urllib.parse.quote(query)
-        url = f"https://api.audnex.us/books?title={q}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=7) as response:
-            data = json.loads(response.read())
-            results = data.get('data', data.get('results', [])) if isinstance(data, dict) else data
-            for item in results:
-                series_info = item.get('series', [])
-                if series_info and isinstance(series_info, list):
-                    name = series_info[0].get('title', '').strip()
-                    if name:
-                        series_names.add(name)
-    except Exception: pass
+    # Audnexus (via Audible catalog → book records)
+    for asin in _audible_asins(query, limit=6):
+        name = _audnexus_series(asin)
+        if name:
+            series_names.add(name)
 
     return sorted(series_names)
 
@@ -358,6 +381,11 @@ def interactive_series_router(filepath, target_dir, memory):
                 return None, None, None, None
             print("Invalid choice.")
         except ValueError: pass
+        except EOFError:
+            # Stdin closed (piped/non-interactive) — leave the file untouched
+            # rather than crashing out of the whole organize run.
+            print("\n    [!] Input closed — skipping this file.")
+            return None, None, None, None
 
 def unique_path(path):
     """Return `path`, or `path` with a ' (N)' suffix if it already exists, so a

@@ -29,7 +29,7 @@ try:
     import termios  # POSIX only — used to flush stdin before interactive prompts
 except ImportError:
     termios = None
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -49,6 +49,14 @@ API_TIMEOUT = 6
 API_SEARCH_LIMIT = 5
 METADATA_SEARCH_TIMEOUT = 15          # max seconds to wait for all metadata APIs
 
+# Audnexus has no title-search route (a bare /books?title= returns 404); it only
+# serves /books/{asin}. So we resolve ASINs through Audible's own unauthenticated
+# catalog search first, then fetch the normalized record per ASIN from Audnexus.
+AUDIBLE_CATALOG_URL = 'https://api.audible.com/1.0/catalog/products'
+AUDNEXUS_BOOK_URL   = 'https://api.audnex.us/books'
+AUDNEXUS_REGION     = 'us'            # Audible marketplace for ASIN lookups
+AUDNEXUS_MAX_DETAIL_WORKERS = 4       # parallel /books/{asin} detail fetches
+
 # Scoring weights and thresholds
 SCORE_TITLE_WEIGHT = 0.65             # how much title match contributes to score
 SCORE_AUTHOR_WEIGHT = 0.33            # how much author match contributes to score
@@ -56,6 +64,8 @@ SCORE_AUTHOR_MISMATCH_WEIGHT = 0.35   # title weight when author doesn't match a
 SCORE_LAST_NAME_FALLBACK = 0.8        # multiplier for last-name-only author match
 SCORE_QUALITY_COVER_BONUS = 0.02      # bonus for having cover art
 SCORE_QUALITY_DESC_BONUS = 0.02       # bonus for having a description
+SCORE_QUALITY_SERIES_BONUS = 0.03     # bonus for series info (audiobook-specific, breaks ties toward richer sources)
+SCORE_QUALITY_NARRATOR_BONUS = 0.02   # bonus for a narrator (audiobook-specific)
 SCORE_AUTO_SELECT_THRESHOLD = 0.55    # minimum score to auto-select a result
 SCORE_SINGLE_RESULT_THRESHOLD = 0.55  # minimum score to auto-select when only one result
 SCORE_KEYWORD_ANCHOR_CAP = 0.30       # cap when no query words appear in result
@@ -72,6 +82,11 @@ DUPE_SEQ_THRESHOLD = 0.90
 # (tens of ms each); a percentage here would be a trap — 1% of a 40h book is 24
 # minutes, enough to hide a whole dropped chapter behind an "OK".
 VERIFY_SOURCE_TOLERANCE_SEC = 15
+# AAC encoder priming/padding is tens of ms per concatenated file and
+# accumulates across the book, so the source-vs-output tolerance grows with the
+# track count on top of the absolute floor — otherwise a 300-track CD rip
+# false-WARNs on ~15s of legitimate, unavoidable delta.
+VERIFY_SOURCE_SLACK_PER_TRACK_SEC = 0.06
 # Online editions genuinely differ (intro/outro, narrator pacing, rounding), so
 # allow a percentage — but cap it, or 5% of a 25h omnibus (75 min) would hide a
 # missing disc.
@@ -115,6 +130,28 @@ ITUNES_COUNTRY_TO_LANG = {
     'de': 'deu', 'at': 'deu', 'fr': 'fra', 'es': 'spa', 'mx': 'spa', 'it': 'ita',
     'br': 'por', 'pt': 'por', 'nl': 'nld', 'se': 'swe', 'no': 'nor', 'dk': 'dan',
     'fi': 'fin', 'jp': 'jpn', 'ru': 'rus', 'pl': 'pol',
+}
+
+# Language normalization → ISO-639-2/B (three-letter), the form the m4b
+# `language` atom and ABS/Plex/Apple language filters expect. Providers hand us
+# three different shapes: Audnexus full English names ('english'), Google Books
+# two-letter ISO-639-1 ('en'), and Open Library / our iTunes country map
+# (already three-letter). This maps every shape we see to one canonical code.
+_LANGUAGE_TO_ISO639_2 = {
+    'eng': 'eng', 'en': 'eng', 'english': 'eng',
+    'deu': 'deu', 'ger': 'deu', 'de': 'deu', 'german': 'deu',
+    'fra': 'fra', 'fre': 'fra', 'fr': 'fra', 'french': 'fra',
+    'spa': 'spa', 'es': 'spa', 'spanish': 'spa',
+    'ita': 'ita', 'it': 'ita', 'italian': 'ita',
+    'por': 'por', 'pt': 'por', 'portuguese': 'por',
+    'nld': 'nld', 'dut': 'nld', 'nl': 'nld', 'dutch': 'nld',
+    'swe': 'swe', 'sv': 'swe', 'swedish': 'swe',
+    'nor': 'nor', 'no': 'nor', 'norwegian': 'nor',
+    'dan': 'dan', 'da': 'dan', 'danish': 'dan',
+    'fin': 'fin', 'fi': 'fin', 'finnish': 'fin',
+    'jpn': 'jpn', 'ja': 'jpn', 'japanese': 'jpn',
+    'rus': 'rus', 'ru': 'rus', 'russian': 'rus',
+    'pol': 'pol', 'pl': 'pol', 'polish': 'pol',
 }
 
 _PLACEHOLDER_ARTISTS = frozenset({
@@ -199,6 +236,23 @@ def _log_tool_versions() -> None:
 
 def natural_sort_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', str(s))]
+
+
+def normalize_language(raw: str) -> str:
+    """Map a provider language value to an ISO-639-2/B three-letter code.
+
+    Returns '' for anything we can't confidently map so callers emit no
+    language rather than a bogus code. A three-letter input we don't recognise
+    is trusted as-is (it's already in the target format)."""
+    if not raw:
+        return ''
+    key = str(raw).strip().lower()
+    mapped = _LANGUAGE_TO_ISO639_2.get(key)
+    if mapped:
+        return mapped
+    if len(key) == 3 and key.isalpha():
+        return key
+    return ''
 
 
 def title_words(s: str) -> set:
@@ -500,6 +554,17 @@ def _ffmeta_escape(value: str) -> str:
     )
 
 
+def _language_stream_args(meta: 'BookMetadata') -> list:
+    """ffmpeg args that tag the audio stream's language.
+
+    The global `language=` key in the FFMETADATA file is silently dropped by
+    ffmpeg's mov/mp4 muxer, so the audio stream itself is the only place a
+    language actually lands in an .m4b. Returns [] when we have no confident
+    ISO-639-2 code, so a bogus code is never written."""
+    lang = normalize_language(meta.language)
+    return ['-metadata:s:a:0', f'language={lang}'] if lang else []
+
+
 _WIN_RESERVED_BASENAMES = (
     {'CON', 'PRN', 'AUX', 'NUL'}
     | {f'COM{i}' for i in range(1, 10)}
@@ -712,10 +777,17 @@ def _score_result(result: dict, query_title: str, query_author: str) -> float:
     Author: full-name Jaccard, with a last-name-only fallback when the full
     match is weak.
 
-    Quality bonus: small reward for results that have cover art / description.
+    Quality bonus: small reward for cover art, description, series, and
+    narrator — enough to break near-ties toward richer, audiobook-specific
+    results (e.g. an Audnexus hit over a bare Open Library edition).
     """
     rt            = result.get('title', '') or ''
-    quality_bonus = (SCORE_QUALITY_COVER_BONUS if result.get('cover_url') else 0) + (SCORE_QUALITY_DESC_BONUS if result.get('desc') else 0)
+    quality_bonus = (
+        (SCORE_QUALITY_COVER_BONUS    if result.get('cover_url')   else 0)
+        + (SCORE_QUALITY_DESC_BONUS     if result.get('desc')        else 0)
+        + (SCORE_QUALITY_SERIES_BONUS   if result.get('series')      else 0)
+        + (SCORE_QUALITY_NARRATOR_BONUS if result.get('narrator')    else 0)
+    )
 
     q_variants = _title_variants(query_title)
     rt_variants = _title_variants(rt)
@@ -836,7 +908,7 @@ def _search_google_books(query: str) -> list:
                 'series_part': '',
                 'narrator':  '',
                 'publisher': vol.get('publisher', '') or '',
-                'language':  vol.get('language', '') or '',
+                'language':  normalize_language(vol.get('language', '')),
                 'genre':     categories[0] if categories else 'Audiobook',
                 'asin':      '',
                 'isbn':      isbn,
@@ -861,7 +933,6 @@ def _search_open_library(query: str) -> list:
             cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else ''
             publishers = doc.get('publisher') or []
             isbns      = doc.get('isbn') or []
-            langs      = doc.get('language') or []
             results.append({
                 'title':       clean_title(doc.get('title', 'Unknown')),
                 'author':      (doc.get('author_name') or ['Unknown'])[0],
@@ -874,7 +945,10 @@ def _search_open_library(query: str) -> list:
                 'series_part': '',
                 'narrator':    '',
                 'publisher':   publishers[0] if publishers else '',
-                'language':    langs[0] if langs else '',
+                # OL's search endpoint returns languages across ALL editions,
+                # not this one, so it's unreliable per-edition — leave language
+                # to iTunes/Audnexus, which are edition-specific.
+                'language':    '',
                 'genre':       'Audiobook',
                 'asin':        '',
                 # OL often returns 13-digit first when available
@@ -886,60 +960,106 @@ def _search_open_library(query: str) -> list:
         return []
 
 
+def _search_audible_asins(title: str, author: str) -> list:
+    """Resolve candidate ASINs via Audible's public catalog search.
+
+    Audnexus has no title search, so this is the entry point that turns a
+    title/author into ASINs we can then look up in Audnexus.
+    """
+    params = {'num_results': API_SEARCH_LIMIT, 'products_sort_by': 'Relevance'}
+    if title.strip():
+        params['title'] = title.strip()
+    if author.strip():
+        params['author'] = author.strip()
+    data = _fetch_json(f"{AUDIBLE_CATALOG_URL}?{urllib.parse.urlencode(params)}")
+    return [p['asin'] for p in (data.get('products') or []) if p.get('asin')]
+
+
+def _fetch_audnexus_book(asin: str) -> dict | None:
+    """Fetch and normalise one Audnexus book record by ASIN.
+
+    The book endpoint's schema differs from the old (dead) search endpoint:
+    series lives in `seriesPrimary` ({name, position}), language is a full
+    English word ('english'), copyright is an integer year, and `summary` is
+    HTML while `description` is a clean one-liner.
+    """
+    data = _fetch_json(f"{AUDNEXUS_BOOK_URL}/{urllib.parse.quote(asin)}?region={AUDNEXUS_REGION}")
+    if not isinstance(data, dict) or not data.get('title'):
+        return None
+
+    authors      = data.get('authors') or []
+    author_str   = authors[0].get('name', 'Unknown') if authors else 'Unknown'
+    narrators    = data.get('narrators') or []
+    narrator_str = narrators[0].get('name', '') if narrators else ''
+
+    series_str = series_pos = ''
+    sp = data.get('seriesPrimary')
+    if isinstance(sp, dict):
+        series_str = sp.get('name', '') or ''
+        series_pos = str(sp.get('position', '') or '')
+
+    genres_list = data.get('genres') or []
+    primary_genre = ''
+    for g in genres_list:
+        if g.get('type', '').lower() == 'genre' and g.get('name'):
+            primary_genre = g['name']
+            break
+    if not primary_genre and genres_list:
+        primary_genre = genres_list[0].get('name', '') or ''
+
+    # Prefer the fuller HTML summary (stripped) over the short plain description.
+    desc = strip_html(data.get('summary', '')) or (data.get('description', '') or '')
+    copyright_val = data.get('copyright', '')
+
+    return {
+        'title':       clean_title(data.get('title', 'Unknown')),
+        'author':      author_str,
+        'year':        (data.get('releaseDate', '') or '')[:4],
+        'date':        (data.get('releaseDate', '') or '')[:10],
+        'cover_url':   data.get('image', '') or '',
+        'desc':        desc,
+        'source':      'Audnexus',
+        'series':      series_str,
+        'series_part': series_pos,
+        'narrator':    narrator_str,
+        'publisher':   data.get('publisherName', '') or '',
+        'language':    normalize_language(data.get('language', '')),
+        'genre':       primary_genre or 'Audiobook',
+        'asin':        data.get('asin', '') or asin,
+        'isbn':        data.get('isbn', '') or '',
+        'copyright':   str(copyright_val) if copyright_val else '',
+        'runtime_min': str(data.get('runtimeLengthMin', '') or ''),
+    }
+
+
 def _search_audnexus(title: str, author: str) -> list:
     """Search Audnexus (Audible data bridge) — audiobook-specific, returns
-    series/position, narrator, ASIN, publisher, language, genres."""
+    series/position, narrator, ASIN, publisher, language, genres, runtime.
+
+    Two-step: Audible catalog search resolves ASINs, then Audnexus returns a
+    normalized record per ASIN. Detail fetches run in parallel, bounded to the
+    catalog result count.
+    """
     try:
-        params = f"title={urllib.parse.quote(title.strip())}"
-        if author.strip():
-            params += f"&author={urllib.parse.quote(author.strip())}"
-        data  = _fetch_json(f"https://api.audnex.us/books?{params}", timeout=API_TIMEOUT + 1)
-        items = data if isinstance(data, list) else data.get('data', data.get('results', []))
-        out   = []
-        for item in items:
-            authors    = item.get('authors', [])
-            author_str = authors[0].get('name', 'Unknown') if authors else 'Unknown'
-            series_str   = ''
-            series_pos   = ''
-            series_parts = item.get('series', []) or []
-            if series_parts and isinstance(series_parts, list):
-                s          = series_parts[0]
-                series_str = s.get('title', '') or ''
-                series_pos = str(s.get('position', '') or '')
-            narrators    = item.get('narrators', []) or []
-            narrator_str = narrators[0].get('name', '') if narrators else ''
-            genres_list  = item.get('genres', []) or []
-            # Audnexus genres are list of {name, type}; pull the first 'genre'
-            # entry, falling back to anything we can find.
-            primary_genre = ''
-            for g in genres_list:
-                if g.get('type', '').lower() == 'genre' and g.get('name'):
-                    primary_genre = g['name']
-                    break
-            if not primary_genre and genres_list:
-                primary_genre = genres_list[0].get('name', '') or ''
-            out.append({
-                'title':       clean_title(item.get('title', 'Unknown')),
-                'author':      author_str,
-                'year':        (item.get('releaseDate', '') or '')[:4],
-                'date':        (item.get('releaseDate', '') or '')[:10],
-                'cover_url':   item.get('image', ''),
-                'desc':        strip_html(item.get('summary', '')),
-                'source':      'Audnexus',
-                'series':      series_str,
-                'series_part': series_pos,
-                'narrator':    narrator_str,
-                'publisher':   item.get('publisherName', '') or '',
-                'language':    item.get('language', '') or '',
-                'genre':       primary_genre or 'Audiobook',
-                'asin':        item.get('asin', '') or '',
-                'isbn':        '',  # not in Audible payload
-                'copyright':   item.get('copyright', '') or '',
-                'runtime_min': str(item.get('runtimeLengthMin', '') or ''),
-            })
-        return out
-    except Exception:
+        asins = _search_audible_asins(title, author)
+    except Exception as e:
+        log.debug(f"Audible catalog search failed for '{title}' / '{author}': {e}")
         return []
+    if not asins:
+        return []
+
+    out: list = []
+    with ThreadPoolExecutor(max_workers=min(AUDNEXUS_MAX_DETAIL_WORKERS, len(asins))) as ex:
+        futures = {ex.submit(_fetch_audnexus_book, a): a for a in asins}
+        for f in as_completed(futures):
+            try:
+                rec = f.result()
+            except Exception as e:
+                log.debug(f"Audnexus book fetch failed for {futures[f]}: {e}")
+                continue
+            if rec:
+                out.append(rec)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +1067,46 @@ def _search_audnexus(title: str, author: str) -> list:
 # ---------------------------------------------------------------------------
 
 _search_cache: dict = {}
+
+# Fields worth backfilling when the same book comes back from more than one
+# provider, so the record we keep is the union of everything we learned rather
+# than whichever provider happened to answer first.
+_MERGEABLE_RESULT_FIELDS = (
+    'cover_url', 'desc', 'series', 'series_part', 'narrator', 'publisher',
+    'language', 'genre', 'asin', 'isbn', 'copyright', 'runtime_min', 'year', 'date',
+)
+
+
+def _merge_result(kept: dict, other: dict) -> None:
+    """Backfill empty fields on `kept` from a duplicate `other` (same title +
+    author from a different provider). Only fills gaps — never overwrites a
+    value kept already has, except 'genre' when kept's is the generic default.
+
+    When the incoming record contributes series or narrator that kept lacked,
+    the source label is promoted so the picker shows where the richer data came
+    from (e.g. 'iTunes+Audnexus')."""
+    gained_audiobook_data = False
+    for field in _MERGEABLE_RESULT_FIELDS:
+        new = (other.get(field) or '')
+        if isinstance(new, str):
+            new = new.strip()
+        if not new:
+            continue
+        cur = (kept.get(field) or '')
+        if isinstance(cur, str):
+            cur = cur.strip()
+        if field == 'genre':
+            if cur in ('', 'Audiobook'):
+                kept[field] = other[field]
+            continue
+        if not cur:
+            kept[field] = other[field]
+            if field in ('series', 'narrator'):
+                gained_audiobook_data = True
+    if gained_audiobook_data and other.get('source'):
+        kept_src = kept.get('source', '') or ''
+        if other['source'] not in kept_src:
+            kept['source'] = f"{kept_src}+{other['source']}" if kept_src else other['source']
 
 
 def search_metadata(title: str, author: str) -> list:
@@ -961,11 +1121,15 @@ def search_metadata(title: str, author: str) -> list:
 
     def _run(title_q: str, author_q: str) -> list:
         query = urllib.parse.quote(f"{title_q} {author_q}".strip())
-        seen: set   = set()
+        by_key: dict   = {}
         combined: list = []
 
         ex = ThreadPoolExecutor(max_workers=4)
         try:
+            # Submission order is also merge priority: the first provider to
+            # return a given (title, author) is the base record, later providers
+            # backfill its gaps. iTunes first (edition-specific language), then
+            # Google, Open Library, Audnexus (series/narrator/runtime).
             futures = [
                 ex.submit(_search_itunes,       query),
                 ex.submit(_search_google_books, query),
@@ -977,13 +1141,19 @@ def search_metadata(title: str, author: str) -> list:
                 f.cancel()
             if not_done:
                 log.warning(f"Metadata search: {len(not_done)} provider(s) timed out after {METADATA_SEARCH_TIMEOUT}s")
-            for f in done:
+            # Iterate in submission order (not done-set order) for deterministic
+            # merge results regardless of which provider finished first.
+            for f in futures:
+                if f not in done:
+                    continue
                 try:
                     for item in f.result():
                         key = (item['title'].lower(), item['author'].lower())
-                        if key not in seen:
-                            seen.add(key)
+                        if key not in by_key:
+                            by_key[key] = item
                             combined.append(item)
+                        else:
+                            _merge_result(by_key[key], item)
                 except Exception as e:
                     log.debug(f"Metadata provider failed: {e}")
         finally:
@@ -1432,6 +1602,35 @@ def _strip_loglevel(args: list) -> list:
     return out
 
 
+# True only for an interactive terminal. When stdout is a pipe (the GUI runs
+# ab.py as a subprocess) or a redirected log, carriage-return progress bars turn
+# into thousands of appended lines a screen reader has to wade through, so we
+# switch to occasional milestone lines instead.
+_STDOUT_IS_TTY = bool(getattr(sys.stdout, 'isatty', lambda: False)())
+PROGRESS_MILESTONE_STEP = 10          # percent between milestone lines when piped
+
+
+def _print_progress(label: str, done: int, total: int, state: dict) -> None:
+    """Emit loop progress: an in-place percentage on a tty, or milestone lines
+    every PROGRESS_MILESTONE_STEP percent when piped. `state` is a per-loop dict
+    that carries the last milestone across calls."""
+    if total <= 0:
+        return
+    pct = int(done / total * 100)
+    if _STDOUT_IS_TTY:
+        print(f"\r    [~] {label}: {pct}%", end='', flush=True)
+        if done >= total:
+            print()
+        return
+    milestone = pct - (pct % PROGRESS_MILESTONE_STEP)
+    if milestone > state.get('last', -1) and milestone > 0:
+        state['last'] = milestone
+        print(f"    [~] {label}: {milestone}%", flush=True)
+    if done >= total and state.get('last', 0) < 100:
+        state['last'] = 100
+        print(f"    [~] {label}: done.", flush=True)
+
+
 def run_ffmpeg_with_progress(cmd: list, total_duration_sec: float, task_name: str = 'Assembling'):
     clean_cmd = _strip_loglevel(cmd)
     clean_cmd = clean_cmd[:1] + ['-loglevel', 'error', '-stats'] + clean_cmd[1:]
@@ -1453,6 +1652,7 @@ def run_ffmpeg_with_progress(cmd: list, total_duration_sec: float, task_name: st
     wd = threading.Thread(target=_watchdog, daemon=True)
     wd.start()
 
+    last_milestone = -1
     try:
         for line in process.stderr:
             m = time_re.search(line)
@@ -1460,9 +1660,15 @@ def run_ffmpeg_with_progress(cmd: list, total_duration_sec: float, task_name: st
                 h, mn, s = m.groups()
                 current  = int(h) * 3600 + int(mn) * 60 + float(s)
                 pct      = min(100.0, current / total_duration_sec * 100.0) if total_duration_sec > 0 else 0
-                filled   = int(40 * pct / 100)
-                bar      = '=' * filled + '-' * (40 - filled)
-                print(f"\r    [~] {task_name}: [{bar}] {pct:.1f}%", end='', flush=True)
+                if _STDOUT_IS_TTY:
+                    filled = int(40 * pct / 100)
+                    bar    = '=' * filled + '-' * (40 - filled)
+                    print(f"\r    [~] {task_name}: [{bar}] {pct:.1f}%", end='', flush=True)
+                else:
+                    milestone = int(pct) - (int(pct) % PROGRESS_MILESTONE_STEP)
+                    if milestone > last_milestone and milestone > 0:
+                        last_milestone = milestone
+                        print(f"    [~] {task_name}: {milestone}%", flush=True)
 
         process.wait()
     finally:
@@ -1474,7 +1680,10 @@ def run_ffmpeg_with_progress(cmd: list, total_duration_sec: float, task_name: st
     if timed_out.is_set():
         raise RuntimeError(f"ffmpeg {task_name.lower()} timed out after {timeout_sec}s")
 
-    print(f"\r    [~] {task_name}: [{'=' * 40}] 100.0%", flush=True)
+    if _STDOUT_IS_TTY:
+        print(f"\r    [~] {task_name}: [{'=' * 40}] 100.0%", flush=True)
+    else:
+        print(f"    [~] {task_name}: done.", flush=True)
 
     if process.returncode != 0:
         raise RuntimeError(f"ffmpeg assembly step failed (exit {process.returncode})")
@@ -1491,7 +1700,10 @@ def already_exists(check_title: str, existing_stems: list) -> bool:
 
 
 def build_existing_stems(output_dir: Path) -> list:
-    return [strip_author_prefix(f.stem.lower()) for f in output_dir.glob('*.m4b')]
+    # rglob, not glob: once a companion organiser (series.py) has sorted output
+    # into Author/Series/ subfolders, a top-level-only scan would go blind and
+    # re-convert everything on the next run.
+    return [strip_author_prefix(f.stem.lower()) for f in output_dir.rglob('*.m4b')]
 
 
 # ---------------------------------------------------------------------------
@@ -1666,21 +1878,121 @@ def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, 
     return chapters
 
 
+# Magic-byte signatures for the image formats a cover download might return.
+# ffmpeg's cover attach only accepts real images; a CDN error page served with
+# HTTP 200 would otherwise be written as "cover.jpg" and fail the whole build.
+_IMAGE_MAGIC = (
+    b'\xff\xd8\xff',            # JPEG
+    b'\x89PNG\r\n\x1a\n',       # PNG
+    b'GIF87a', b'GIF89a',       # GIF
+    b'RIFF',                    # WEBP (RIFF....WEBP)
+    b'BM',                      # BMP
+)
+
+
+def _looks_like_image(data: bytes) -> bool:
+    return any(data.startswith(sig) for sig in _IMAGE_MAGIC)
+
+
 def _download_cover(cover_url: str, dest: Path) -> Path | None:
-    """Download cover art to dest. Returns the path on success, None on failure."""
+    """Download cover art to dest. Returns the path on success, None on failure.
+
+    Validates the payload is actually an image (by magic bytes) before writing,
+    so a CDN error page or HTML redirect served with a 200 status doesn't get
+    saved as a bogus cover that later fails the ffmpeg cover-attach step."""
     try:
         req = urllib.request.Request(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as r, open(dest, 'wb') as out:
-            out.write(r.read())
-        print("    [+] Cover art downloaded.")
-        return dest
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = r.read()
     except Exception as e:
         print(f"    [!] Cover art download failed: {e}")
         return None
+    if not data or not _looks_like_image(data):
+        print("    [!] Cover art download did not return a valid image — skipping cover.")
+        log.warning(f"Cover art from {cover_url[:120]} was not a recognised image ({len(data)} bytes)")
+        return None
+    try:
+        with open(dest, 'wb') as out:
+            out.write(data)
+    except OSError as e:
+        print(f"    [!] Could not save cover art: {e}")
+        return None
+    print("    [+] Cover art downloaded.")
+    return dest
+
+
+def _read_all_tags(path: Path) -> dict:
+    """Return all format-level tags from a media file, lowercased keys (or {})."""
+    cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', str(path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        data = json.loads(result.stdout)
+        return {k.lower(): v for k, v in (data.get('format', {}).get('tags') or {}).items()}
+    except Exception:
+        return {}
+
+
+def _backfill_meta_from_source(meta: BookMetadata, source: Path) -> BookMetadata:
+    """Return a copy of `meta` with empty fields filled from `source`'s existing
+    tags. Retagging a book we found no (or only a sparse local) match for must
+    not discard richer metadata the file already carried — narrator, series,
+    description, publisher, etc. Never overwrites a value `meta` already has."""
+    tags = _read_all_tags(source)
+    if not tags:
+        return meta
+    m = replace(meta)
+
+    def fill(attr: str, *keys: str) -> None:
+        if getattr(m, attr, ''):
+            return
+        for k in keys:
+            v = (tags.get(k) or '').strip()
+            if v:
+                setattr(m, attr, v)
+                return
+
+    fill('title',       'title', 'album')
+    fill('author',      'artist', 'album_artist')
+    fill('narrator',    'composer')
+    fill('series',      'show')
+    fill('series_part', 'episode_id')
+    fill('description', 'description', 'comment', 'synopsis')
+    fill('publisher',   'publisher')
+    fill('date',        'date')
+    fill('isbn',        'isbn')
+    fill('asin',        'asin')
+    fill('copyright_',  'copyright')
+
+    # 'genre' has a non-empty default, so fill() would never replace it.
+    if m.genre in ('', 'Audiobook'):
+        g = (tags.get('genre') or '').strip()
+        if g:
+            m.genre = g
+
+    # Legacy 'grouping' ("Series #N") as a series fallback when there's no
+    # dedicated show/episode_id atom.
+    if not m.series:
+        grouping = (tags.get('grouping') or '').strip()
+        if grouping:
+            mo = re.match(r'^(.*?)\s*#\s*([\d.]+)\s*$', grouping)
+            if mo:
+                m.series = mo.group(1).strip()
+                if not m.series_part:
+                    m.series_part = mo.group(2)
+            else:
+                m.series = grouping
+    return m
 
 
 def retag_m4b(source_file: Path, meta: BookMetadata) -> bool:
-    """Overwrite metadata tags on an existing .m4b in-place (stream-copy)."""
+    """Overwrite metadata tags on an existing .m4b in-place (stream-copy).
+
+    Because `-map_metadata 1` replaces the file's global metadata wholesale,
+    any tag not present in `meta` would be lost. So we first backfill `meta`'s
+    empty fields from the file's existing tags — a book with a good narrator /
+    description / series that got only a sparse (or skipped) match must not come
+    out worse-tagged than it went in."""
+    meta = _backfill_meta_from_source(meta, source_file)
     tmp_out = source_file.with_suffix('.retag.m4b')
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1706,7 +2018,8 @@ def retag_m4b(source_file: Path, meta: BookMetadata) -> bool:
             # (audio + the existing attached_pic + any extra streams).
             cmd += ['-map', '0', '-c:v', 'copy']
         cmd += ['-map_metadata', '1', '-map_chapters', '0',
-                '-c:a', 'copy', '-movflags', '+faststart', str(tmp_out)]
+                '-c:a', 'copy', *_language_stream_args(meta),
+                '-movflags', '+faststart', str(tmp_out)]
 
         try:
             result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -1772,6 +2085,25 @@ def _probe_for_verify(path: Path) -> dict | None:
         return None
 
 
+def _probe_source_chapters(path: Path) -> list[tuple[int, int, str]]:
+    """Return a file's embedded chapters as (start_ms, end_ms, title) tuples.
+
+    Empty if the file has none. Lets a single-file source keep real chapter
+    markers through the re-mux instead of collapsing to one whole-book chapter."""
+    data = _probe_for_verify(path)
+    if not data:
+        return []
+    specs: list[tuple[int, int, str]] = []
+    for c in data.get('chapters', []):
+        start_ms = int(_safe_float(c.get('start_time')) * 1000)
+        end_ms   = int(_safe_float(c.get('end_time')) * 1000)
+        if end_ms <= start_ms:
+            continue
+        title = (c.get('tags') or {}).get('title', '') or f"Chapter {len(specs) + 1}"
+        specs.append((start_ms, end_ms, title))
+    return specs
+
+
 def _emit_verify_report(output_file: Path, header: str,
                         checks: list[tuple[str, str]], write_report: bool) -> dict:
     """Print, log, and (optionally) write a sidecar for a list of
@@ -1807,7 +2139,7 @@ def _emit_verify_report(output_file: Path, header: str,
 
 def verify_output(output_file: Path, meta: BookMetadata,
                   expected_duration_sec: float, expected_chapters: int | None,
-                  write_report: bool = True) -> dict:
+                  write_report: bool = True, source_tracks: int = 1) -> dict:
     """Check a finished .m4b against expectations and emit a linear report.
 
     Checks file validity, source-vs-output duration, online-edition runtime
@@ -1845,12 +2177,17 @@ def verify_output(output_file: Path, meta: BookMetadata,
 
     out_dur = _safe_float(fmt.get('duration'))
 
+    # Source tolerance grows with track count: AAC priming accumulates a little
+    # per concatenated file, so a many-track rip legitimately drifts more.
+    src_tol = max(VERIFY_SOURCE_TOLERANCE_SEC,
+                  source_tracks * VERIFY_SOURCE_SLACK_PER_TRACK_SEC)
+
     # 2. Duration vs source audio — tight absolute tolerance, no percentage.
     if out_dur <= 0:
         checks.append(('WARN', 'Output duration could not be read.'))
     elif expected_duration_sec > 0:
         delta = abs(out_dur - expected_duration_sec)
-        if _within_tolerance(out_dur, expected_duration_sec, VERIFY_SOURCE_TOLERANCE_SEC, 0.0):
+        if _within_tolerance(out_dur, expected_duration_sec, src_tol, 0.0):
             checks.append(('OK', f'Duration {_fmt_hms(out_dur)} matches source (delta {int(delta)}s).'))
         else:
             direction = 'shorter' if out_dur < expected_duration_sec else 'longer'
@@ -1884,8 +2221,8 @@ def verify_output(output_file: Path, meta: BookMetadata,
         # Coverage: chapters should span the file — first near t=0, last ending
         # near the audio end. A gap means part of the book has no chapter, which
         # breaks nonvisual navigation.
-        covers_start = starts[0] <= VERIFY_SOURCE_TOLERANCE_SEC
-        covers_end   = (out_dur <= 0) or (ends[-1] >= out_dur - VERIFY_SOURCE_TOLERANCE_SEC)
+        covers_start = starts[0] <= src_tol
+        covers_end   = (out_dur <= 0) or (ends[-1] >= out_dur - src_tol)
         if expected_chapters is not None and len(chapters) != expected_chapters:
             checks.append(('WARN', f'{len(chapters)} chapters in output, expected {expected_chapters}.'))
         elif not ordered:
@@ -1997,7 +2334,10 @@ def process_book(
         return
 
     # --- Single .m4b: already converted -----------------------------------
-    if len(files) == 1 and files[0].suffix.lower() == '.m4b':
+    # When --chapterize is requested we skip this fast copy path and fall
+    # through to the general path, which can run speech detection and re-mux
+    # the chapters in (still a stream-copy for an AAC .m4b, so no re-encode).
+    if len(files) == 1 and files[0].suffix.lower() == '.m4b' and not chapterize:
         if cached_decision and not cached_decision.get('aborted'):
             meta = BookMetadata.from_decision(cached_decision)
             print(f"    [*] Using cached decision: \"{meta.title}\" by {meta.author}")
@@ -2054,6 +2394,7 @@ def process_book(
 
     print(f"[*] Probing {len(files)} file(s) …")
     track_data: list = []
+    probe_progress: dict = {}
     with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as ex:
         futures = {ex.submit(probe_file, f): f for f in files}
         done = 0
@@ -2062,8 +2403,7 @@ def process_book(
             res = future.result()
             if res:
                 track_data.append(res)
-            print(f"\r    [~] Probing: {int(done / len(files) * 100)}%", end='', flush=True)
-    print()
+            _print_progress('Probing', done, len(files), probe_progress)
 
     track_data.sort(key=lambda t: natural_sort_key(t['path']))
 
@@ -2146,6 +2486,7 @@ def process_book(
                     future_map[xc.submit(transcode_worker, t['path'], out, bitrate, normalize)] = i
 
                 done = 0
+                transcode_progress: dict = {}
                 for future in as_completed(future_map):
                     done += 1
                     idx = future_map[future]
@@ -2154,8 +2495,7 @@ def process_book(
                         successful_indexes.add(idx)
                     except RuntimeError as e:
                         transcode_errors.append(str(e))
-                    print(f"\r    [~] Transcoding: {int(done / len(track_data) * 100)}%", end='', flush=True)
-            print()
+                    _print_progress('Transcoding', done, len(track_data), transcode_progress)
 
             if transcode_errors:
                 print(f"[!] {len(transcode_errors)}/{len(track_data)} file(s) failed to transcode:")
@@ -2205,7 +2545,7 @@ def process_book(
 
         # Speech-based chapter detection for single-file audiobooks
         speech_chapters: list[tuple[float, str]] = []
-        if chapterize and len(track_data) == 1 and track_data[0]['path'].suffix.lower() != '.m4b':
+        if chapterize and len(track_data) == 1:
             print("    [~] Running speech chapter detection …")
             log.info("Chapterize: starting speech detection")
             detected = detect_chapters_speech(track_data[0]['path'], tmp)
@@ -2238,7 +2578,7 @@ def process_book(
                 print("    [!] No chapter markers detected via speech recognition.")
                 log.info("Chapterize: no chapter markers detected")
 
-        # --- Build the chapter list (either speech-detected or per-track) --
+        # --- Build the chapter list (speech-detected, embedded, or per-track) --
         chapter_specs: list[tuple[int, int, str]] = []
         if speech_chapters:
             total_ms = int(total_sec * 1000)
@@ -2251,11 +2591,21 @@ def process_book(
                           if idx + 1 < len(speech_chapters) else total_ms)
                 chapter_specs.append((start_ms, end_ms, ch_title))
         else:
-            for i, t in enumerate(track_data):
-                dur_ms = int(t['duration'] * 1000)
-                chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
-                chapter_specs.append((curr_ms, curr_ms + dur_ms, chapter_title))
-                curr_ms += dur_ms
+            # A single source file (e.g. an .m4a or chapterless-looking .m4b
+            # taking the concat path) may already carry real chapter markers.
+            # The per-track fallback would flatten those into one whole-book
+            # chapter, so preserve the embedded ones when there's real structure.
+            embedded = _probe_source_chapters(track_data[0]['path']) if len(track_data) == 1 else []
+            if len(embedded) > 1:
+                print(f"    [+] Preserving {len(embedded)} embedded chapter(s) from source.")
+                log.info(f"Preserving {len(embedded)} embedded chapter(s) from source file")
+                chapter_specs = embedded
+            else:
+                for i, t in enumerate(track_data):
+                    dur_ms = int(t['duration'] * 1000)
+                    chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
+                    chapter_specs.append((curr_ms, curr_ms + dur_ms, chapter_title))
+                    curr_ms += dur_ms
 
         # --- Write concat list and FFMETADATA file -------------------------
         # Paths inside the staging tmpdir are numbered (input_NNNN.ext) so
@@ -2286,39 +2636,67 @@ def process_book(
             print(f"    [+] ASIN:     {meta.asin}")
 
         # --- Build the ffmpeg assembly command -----------------------------
-        cmd = [
-            'ffmpeg', '-y', '-nostdin',
-            '-f', 'concat', '-safe', '0', '-i', str(concat_list),
-            '-i', str(meta_file),
-        ]
-        if cover_file and cover_file.exists():
-            cmd += cover_input_args(cover_file, audio_input_index=0, cover_input_index=2)
-        else:
-            cmd += ['-map', '0:a']
+        # Assemble to a .partial first, then atomically rename on success. An
+        # interrupted or killed ffmpeg (Ctrl-C, power loss, GUI cancel) must
+        # never leave a truncated .m4b at the real path — a later run would see
+        # it via exists() and skip the book as "already done", hiding a
+        # half-built audiobook in the library permanently. `-f ipod` is required
+        # because the muxer can't infer MP4 from the .partial extension (same
+        # reason transcode_worker needs it).
+        assembly_partial = output_file.with_suffix(output_file.suffix + '.partial')
+        assembly_partial.unlink(missing_ok=True)
 
-        cmd += [
-            '-map_metadata', '1',
-            '-map_chapters', '1',
-            '-c:a', 'copy',
-            '-movflags', '+faststart',
-            str(output_file),
-        ]
+        def _build_assembly_cmd(with_cover: bool) -> list:
+            c = [
+                'ffmpeg', '-y', '-nostdin',
+                '-f', 'concat', '-safe', '0', '-i', str(concat_list),
+                '-i', str(meta_file),
+            ]
+            if with_cover and cover_file and cover_file.exists():
+                c += cover_input_args(cover_file, audio_input_index=0, cover_input_index=2)
+            else:
+                c += ['-map', '0:a']
+            c += [
+                '-map_metadata', '1',
+                '-map_chapters', '1',
+                '-c:a', 'copy',
+                *_language_stream_args(meta),
+                '-movflags', '+faststart',
+                '-f', 'ipod',
+                str(assembly_partial),
+            ]
+            return c
 
+        have_cover = bool(cover_file and cover_file.exists())
         try:
-            run_ffmpeg_with_progress(cmd, total_sec, task_name='Assembling')
+            run_ffmpeg_with_progress(_build_assembly_cmd(have_cover), total_sec, task_name='Assembling')
         except RuntimeError as e:
-            print(f"\n[!] Assembly failed: {e}")
-            log.error(f"Assembly failed: {e}")
-            if output_file.exists():
-                output_file.unlink()
-                log.info(f"Removed partial output: {output_file.name}")
-            return
+            assembly_partial.unlink(missing_ok=True)
+            # A bad cover image shouldn't cost the whole (possibly hours-long)
+            # assembly — retry once without it before giving up.
+            if have_cover:
+                print(f"\n[!] Assembly failed with cover art ({e}); retrying without cover …")
+                log.warning(f"Assembly failed with cover; retrying coverless: {e}")
+                try:
+                    run_ffmpeg_with_progress(_build_assembly_cmd(False), total_sec, task_name='Assembling')
+                except RuntimeError as e2:
+                    print(f"\n[!] Assembly failed: {e2}")
+                    log.error(f"Assembly failed (coverless retry): {e2}")
+                    assembly_partial.unlink(missing_ok=True)
+                    return
+            else:
+                print(f"\n[!] Assembly failed: {e}")
+                log.error(f"Assembly failed: {e}")
+                return
+
+        assembly_partial.replace(output_file)
 
     print(f"[+] Created: {output_file.name}")
     log.info(f"Created: {output_file.name}  ({len(track_data)} track(s), {'stream-copy' if can_copy else bitrate})")
 
     if verify:
-        verify_output(output_file, meta, total_sec, expected_chapters=len(chapter_specs))
+        verify_output(output_file, meta, total_sec, expected_chapters=len(chapter_specs),
+                      source_tracks=len(track_data))
 
     if existing_stems is not None:
         existing_stems.append(strip_author_prefix(output_file.stem.lower()))
@@ -2352,6 +2730,12 @@ def main():
 
     global NON_INTERACTIVE
     NON_INTERACTIVE = bool(args.non_interactive)
+
+    # Validate bitrate up front — a typo like '192kk' or '19x' otherwise fails
+    # every transcode with a confusing per-file ffmpeg error deep into a run.
+    if not re.fullmatch(r'\d+k?', args.bitrate.strip(), flags=re.IGNORECASE):
+        print(f"[!] Invalid bitrate '{args.bitrate}'. Use a form like 192k, 128k, or a plain bps value.")
+        sys.exit(1)
 
     in_p  = Path(args.input).resolve()
     out_p = Path(args.output).resolve()
@@ -2414,25 +2798,39 @@ def main():
 
     existing_stems = build_existing_stems(out_p)
 
+    failures = 0
     for book_dir, book_files in sorted(books.items(), key=lambda kv: natural_sort_key(kv[0])):
-        process_book(
-            book_dir, book_files, out_p,
-            bitrate=args.bitrate,
-            dry_run=args.dry_run,
-            auto_lookup=args.auto_lookup,
-            no_lookup=args.no_lookup,
-            existing_stems=existing_stems,
-            chapterize=args.chapterize,
-            accept_chapters=args.accept_chapters,
-            skip_transcode_errors=args.skip_transcode_errors,
-            normalize=args.normalize,
-            decision_cache=decision_cache,
-            cache_path=cache_path,
-            verify=not args.no_verify,
-        )
+        try:
+            process_book(
+                book_dir, book_files, out_p,
+                bitrate=args.bitrate,
+                dry_run=args.dry_run,
+                auto_lookup=args.auto_lookup,
+                no_lookup=args.no_lookup,
+                existing_stems=existing_stems,
+                chapterize=args.chapterize,
+                accept_chapters=args.accept_chapters,
+                skip_transcode_errors=args.skip_transcode_errors,
+                normalize=args.normalize,
+                decision_cache=decision_cache,
+                cache_path=cache_path,
+                verify=not args.no_verify,
+            )
+        except Exception as e:
+            # One book's unexpected error (disk full mid-copy, an NFS blip, a
+            # corrupt source) must not sink the rest of an overnight batch.
+            # SystemExit / KeyboardInterrupt derive from BaseException and are
+            # deliberately NOT caught here, so a closed stdin or Ctrl-C still
+            # aborts the whole run.
+            failures += 1
+            log.exception(f"Unhandled error processing {book_dir.name}: {e}")
+            print(f"[!] Error processing '{book_dir.name}': {e} — skipping to next book.")
 
-    log.info("Done")
-    print("\n[+] All done.")
+    log.info(f"Done ({failures} book(s) failed)" if failures else "Done")
+    if failures:
+        print(f"\n[+] All done — {failures} book(s) failed with errors (see the log).")
+    else:
+        print("\n[+] All done.")
 
 
 if __name__ == '__main__':

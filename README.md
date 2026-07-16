@@ -90,7 +90,11 @@ python3 ab.py /path/to/audiobooks -o /path/to/output --re-prompt "/path/to/audio
 | `--auto-lookup` | Auto-pick the top metadata result if it scores above the confidence threshold. |
 | `--no-lookup` | Skip all online metadata lookups; tag from folder name and existing file tags. |
 | `--chapterize` | For single-file audiobooks, run `faster-whisper` over silence-gap candidates to detect spoken chapter markers ("Chapter Three", "Prologue", etc.). |
+| `--accept-chapters` | With `--chapterize`, accept the detected chapters without prompting (for non-interactive / GUI use). |
+| `--normalize` | Loudness-normalize each file to ≈-18 LUFS (EBU R128, two-pass, linear). Skip for full-cast productions where dynamic range is intentional. |
 | `--skip-transcode-errors` | If some source files fail to transcode, assemble the audiobook anyway (loudly warns; the output will be missing those tracks). |
+| `--no-verify` | Skip the post-build verification report (duration/chapter/tag/cover checks + `.ab_report.txt` sidecar). |
+| `--non-interactive` | Never prompt — any book that would need a prompt (uncached, not auto-lookup) is skipped cleanly. Use when launching from a GUI, cron, or a pipe. |
 | `--clear-cache` | Delete the entire decision cache and re-prompt for every book. |
 | `--re-prompt PATH [PATH …]` | Drop cached decisions for the listed folder paths only; leaves the rest of the cache intact. Use this when one book got the wrong match. |
 | `--log FILE` | Override the log file path (default: `ab_<TIMESTAMP>.log` in the output dir). |
@@ -161,8 +165,11 @@ Releases are built automatically by `.github/workflows/release-windows.yml` when
 README.md                        — this file
 ab.py                            — the CLI / conversion engine
 gui.py                           — the wxPython desktop GUI
+series.py                        — companion organiser: sorts loose .m4b files into Author/Series/Title.m4b
+test_ab.py                       — unit + ffmpeg end-to-end tests (python3 test_ab.py)
 audiobookConverter.spec          — PyInstaller spec (builds ab.exe + Audiobook Converter.exe)
 .github/workflows/release-windows.yml — CI: build & publish Windows release on v* tag
+.github/workflows/test.yml       — CI: run the test suite on every push
 ```
 
 ## License

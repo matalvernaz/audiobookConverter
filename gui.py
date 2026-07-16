@@ -844,7 +844,22 @@ class MainFrame(wx.Frame):
                         title  = ab.strip_author_from_title(title, author)
                         e.detected_title  = title
                         e.detected_author = author
-                        e.total_duration_sec = float(initial.get('duration', 0) or 0) * e.track_count
+                        # Estimate total length by scaling the first file's
+                        # duration by total-bytes / first-file-bytes, rather than
+                        # first-duration × track-count. The latter turns a 30s
+                        # intro track into a wildly wrong figure; byte-scaling is
+                        # near-exact for uniform-bitrate rips and sane for mixed
+                        # ones, without probing every file during the scan.
+                        first_dur = float(initial.get('duration', 0) or 0)
+                        try:
+                            first_size = e.files[0].stat().st_size
+                            total_size = sum(f.stat().st_size for f in e.files)
+                            e.total_duration_sec = (
+                                first_dur * (total_size / first_size)
+                                if first_size > 0 else first_dur * e.track_count
+                            )
+                        except OSError:
+                            e.total_duration_sec = first_dur * e.track_count
 
                 # Apply cached decisions
                 for e in entries:
@@ -995,8 +1010,10 @@ class MainFrame(wx.Frame):
         pending = [e for e in self.books if e.status == 'pending']
         if pending and not self.auto_lookup_ctrl.GetValue():
             if wx.MessageBox(
-                f'{len(pending)} book(s) still need metadata. They will be '
-                f'skipped (no online lookup, no embed). Continue?',
+                f'{len(pending)} book(s) still need metadata and will NOT be '
+                f'converted — they have no saved choice and auto-pick is off. '
+                f'Look them up (or tick "Auto-pick top match") to include them. '
+                f'Convert the rest now?',
                 'Books still pending',
                 wx.YES_NO | wx.ICON_QUESTION, self,
             ) != wx.YES:
@@ -1027,7 +1044,17 @@ class MainFrame(wx.Frame):
         dlg.ShowModal()
         dlg.Destroy()
 
-        # Re-scan to refresh statuses after conversion
+        # ab.py may have written new decisions during the run (notably under
+        # --auto-lookup). Reload the cache from disk so our in-memory copy
+        # doesn't clobber them the next time we save (e.g. a later Skip /
+        # Re-prompt), and refresh statuses of any books that were pending.
+        self._load_cache()
+        for e in self.books:
+            cached = self.decision_cache.get(str(e.book_dir))
+            if cached and not cached.get('aborted') and e.status == 'pending':
+                e.decision = cached
+                e.status = 'cached'
+        self._rebuild_list()
         self.SetStatusText('Conversion finished. Re-scan to see updated state.')
 
     # ----------------------------------------------------------------------

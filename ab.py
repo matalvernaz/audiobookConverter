@@ -1746,6 +1746,17 @@ def _find_silence_ends(audio_file: Path, noise_db: int = SILENCE_NOISE_DB, min_d
     return [float(m.group(1)) for m in re.finditer(r'silence_end: (\d+\.?\d*)', result.stderr)]
 
 
+def should_detect_chapters(chapterize: bool, n_tracks: int, embedded_chapters: int) -> bool:
+    """Whether --chapterize should run speech detection on this book.
+
+    Detection is for a single source file with no usable chapter list. A source
+    that already carries two or more chapters keeps them: a recogniser that
+    catches only the first heading would otherwise collapse the whole book into
+    one chapter, and a publisher's list is better than a guessed one anyway.
+    """
+    return chapterize and n_tracks == 1 and embedded_chapters < 2
+
+
 def detect_chapters_speech(audio_file: Path, tmpdir: Path) -> list[tuple[float, str]]:
     """
     Scan an audio file for spoken chapter markers using faster-whisper.
@@ -2139,14 +2150,17 @@ def _emit_verify_report(output_file: Path, header: str,
 
 def verify_output(output_file: Path, meta: BookMetadata,
                   expected_duration_sec: float, expected_chapters: int | None,
-                  write_report: bool = True, source_tracks: int = 1) -> dict:
+                  write_report: bool = True, source_tracks: int = 1,
+                  source_chapters: int = 0) -> dict:
     """Check a finished .m4b against expectations and emit a linear report.
 
     Checks file validity, source-vs-output duration, online-edition runtime
     (when Audnexus gave us one), chapter count + ordering, cover art, codec and
     the core tags. The duration-delta check is the load-bearing one: it catches
     ffmpeg truncations and dropped source files that are otherwise invisible
-    until you hit a gap mid-listen.
+    until you hit a gap mid-listen. `source_chapters` is how many the single
+    source carried; fewer in the output is a FAIL, because a flattened chapter
+    list is silent until someone tries to navigate by it.
     """
     header = (meta.title or output_file.stem) + (f" by {meta.author}" if meta.author else '')
     data = _probe_for_verify(output_file)
@@ -2209,6 +2223,11 @@ def verify_output(output_file: Path, meta: BookMetadata,
             direction = 'shorter' if out_dur < edition_sec else 'longer'
             checks.append(('WARN', f'Output is {_fmt_hms(delta)} {direction} than the online edition '
                                    f'({_fmt_hms(out_dur)} vs ~{_fmt_hms(edition_sec)}) — could be a missing file/disc, or just a different edition.'))
+
+    # A single source with a real chapter list must not lose any of it.
+    if source_chapters > 1 and len(chapters) < source_chapters:
+        checks.append(('FAIL', f'{len(chapters)} chapters in output but the source carried '
+                               f'{source_chapters} — chapters were lost.'))
 
     # 4. Chapters
     if chapters:
@@ -2383,9 +2402,10 @@ def process_book(
 
         if verify:
             src_dur = float(initial.get('duration', 0) or 0) if initial else 0.0
-            # Source chapters are preserved as-is on a stream-copy retag, so we
-            # don't assert a specific count for the single-file path.
-            verify_output(output_file, meta, src_dur, expected_chapters=None)
+            # Source chapters are preserved as-is on a stream-copy retag, so no
+            # specific count is asserted -- only that none were lost.
+            verify_output(output_file, meta, src_dur, expected_chapters=None,
+                          source_chapters=len(_probe_source_chapters(files[0])))
 
         if existing_stems is not None:
             existing_stems.append(strip_author_prefix(output_file.stem.lower()))
@@ -2543,9 +2563,18 @@ def process_book(
         total_sec = sum(t['duration'] for t in track_data)
         curr_ms   = 0
 
+        # A single source file may already carry real chapter markers. Probe them
+        # first: they decide whether speech detection runs at all, and they are
+        # what the per-track fallback would otherwise flatten into one chapter.
+        embedded = _probe_source_chapters(track_data[0]['path']) if len(track_data) == 1 else []
+
         # Speech-based chapter detection for single-file audiobooks
         speech_chapters: list[tuple[float, str]] = []
-        if chapterize and len(track_data) == 1:
+        detect = should_detect_chapters(chapterize, len(track_data), len(embedded))
+        if chapterize and len(track_data) == 1 and not detect:
+            print(f"    [*] Source already carries {len(embedded)} chapters — keeping them; speech detection skipped.")
+            log.info(f"Chapterize: skipped, source carries {len(embedded)} embedded chapter(s)")
+        if detect:
             print("    [~] Running speech chapter detection …")
             log.info("Chapterize: starting speech detection")
             detected = detect_chapters_speech(track_data[0]['path'], tmp)
@@ -2590,22 +2619,16 @@ def process_book(
                 end_ms = (int(speech_chapters[idx + 1][0] * 1000)
                           if idx + 1 < len(speech_chapters) else total_ms)
                 chapter_specs.append((start_ms, end_ms, ch_title))
+        elif len(embedded) > 1:
+            print(f"    [+] Preserving {len(embedded)} embedded chapter(s) from source.")
+            log.info(f"Preserving {len(embedded)} embedded chapter(s) from source file")
+            chapter_specs = embedded
         else:
-            # A single source file (e.g. an .m4a or chapterless-looking .m4b
-            # taking the concat path) may already carry real chapter markers.
-            # The per-track fallback would flatten those into one whole-book
-            # chapter, so preserve the embedded ones when there's real structure.
-            embedded = _probe_source_chapters(track_data[0]['path']) if len(track_data) == 1 else []
-            if len(embedded) > 1:
-                print(f"    [+] Preserving {len(embedded)} embedded chapter(s) from source.")
-                log.info(f"Preserving {len(embedded)} embedded chapter(s) from source file")
-                chapter_specs = embedded
-            else:
-                for i, t in enumerate(track_data):
-                    dur_ms = int(t['duration'] * 1000)
-                    chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
-                    chapter_specs.append((curr_ms, curr_ms + dur_ms, chapter_title))
-                    curr_ms += dur_ms
+            for i, t in enumerate(track_data):
+                dur_ms = int(t['duration'] * 1000)
+                chapter_title = t['title'] if t['title'] != t['path'].stem else f"Chapter {i + 1}"
+                chapter_specs.append((curr_ms, curr_ms + dur_ms, chapter_title))
+                curr_ms += dur_ms
 
         # --- Write concat list and FFMETADATA file -------------------------
         # Paths inside the staging tmpdir are numbered (input_NNNN.ext) so
@@ -2696,7 +2719,7 @@ def process_book(
 
     if verify:
         verify_output(output_file, meta, total_sec, expected_chapters=len(chapter_specs),
-                      source_tracks=len(track_data))
+                      source_tracks=len(track_data), source_chapters=len(embedded))
 
     if existing_stems is not None:
         existing_stems.append(strip_author_prefix(output_file.stem.lower()))

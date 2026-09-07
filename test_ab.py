@@ -482,3 +482,65 @@ class SourceMetadataE2ETests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ShouldDetectChaptersTests(unittest.TestCase):
+    """--chapterize is for single-file sources with no usable chapter list."""
+
+    def test_single_chapterless_source_is_detected(self):
+        self.assertTrue(ab.should_detect_chapters(True, 1, 0))
+        # One whole-file chapter is not a chapter list.
+        self.assertTrue(ab.should_detect_chapters(True, 1, 1))
+
+    def test_source_with_real_chapters_keeps_them(self):
+        self.assertFalse(ab.should_detect_chapters(True, 1, 2))
+        self.assertFalse(ab.should_detect_chapters(True, 1, 51))
+
+    def test_multi_track_and_no_flag_never_detect(self):
+        self.assertFalse(ab.should_detect_chapters(True, 12, 0))
+        self.assertFalse(ab.should_detect_chapters(False, 1, 0))
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, "ffmpeg/ffprobe not on PATH")
+class VerifyChapterLossE2ETests(unittest.TestCase):
+    """An output with fewer chapters than its single source is a failure, not a warning."""
+
+    def _build(self, tmp: Path, chapters: int, seconds: int = 4) -> tuple[Path, ab.BookMetadata]:
+        src = tmp / "src.m4a"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"sine=frequency=440:duration={seconds}",
+             "-c:a", "aac", "-b:a", "64k", str(src)],
+            check=True, capture_output=True, timeout=60,
+        )
+        meta = ab.BookMetadata(title="Test Book", author="Test Author")
+        step = (seconds * 1000) // chapters
+        specs = [(i * step, (i + 1) * step if i < chapters - 1 else seconds * 1000, f"Chapter {i + 1}")
+                 for i in range(chapters)]
+        meta_file = tmp / "meta.txt"
+        meta_file.write_text(ab.render_book_ffmetadata(meta, specs), encoding="utf-8")
+        out = tmp / "Test Author - Test Book.m4b"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-i", str(meta_file),
+             "-map", "0:a", "-map_metadata", "1", "-map_chapters", "1",
+             "-c:a", "copy", "-f", "ipod", str(out)],
+            check=True, capture_output=True, timeout=60,
+        )
+        return out, meta
+
+    def test_fewer_chapters_than_source_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            out, meta = self._build(Path(d), chapters=1)
+            result = ab.verify_output(out, meta, expected_duration_sec=4.0, expected_chapters=None,
+                                      write_report=False, source_chapters=3)
+            self.assertGreaterEqual(result["fail"], 1)
+            self.assertTrue(any(lvl == "FAIL" and "chapters were lost" in msg
+                                for lvl, msg in result["checks"]), result["checks"])
+
+    def test_same_count_is_not_a_loss(self):
+        with tempfile.TemporaryDirectory() as d:
+            out, meta = self._build(Path(d), chapters=3)
+            result = ab.verify_output(out, meta, expected_duration_sec=4.0, expected_chapters=None,
+                                      write_report=False, source_chapters=3)
+            self.assertEqual(result["fail"], 0)
+            self.assertFalse(any("chapters were lost" in msg for _, msg in result["checks"]))
